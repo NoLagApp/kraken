@@ -1,0 +1,12 @@
+# Zero-config single node: static auth (examples/auth.json), syn broker, ets store.
+services:
+  kraken:
+    build: .
+    container_name: kraken
+    ports:
+      - "8080:8080"   # WebSocket + HTTP
+      - "1883:1883"   # MQTT ingress
+    environment:
+      - AUTH_ALLOW_ALL=${AUTH_ALLOW_ALL:-false}
+    volumes:
+      - ./examples/auth.json:/app/examples/auth.json:ro

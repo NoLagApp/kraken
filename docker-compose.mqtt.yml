@@ -1,0 +1,27 @@
+# Kraken backed by an external MQTT broker (Mosquitto) via the mqtt broker backend.
+# Proves the broker plugin seam: same wire protocol, swapped fan-out.
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: kraken-mosquitto
+    command: mosquitto -c /mosquitto-no-auth.conf
+    networks: [kraken-net]
+
+  kraken:
+    build: .
+    container_name: kraken-mqtt
+    ports:
+      - "18081:8080"
+    environment:
+      - BROKER_BACKEND=mqtt
+      - MQTT_BROKER_HOST=mosquitto
+      - MQTT_BROKER_PORT=1883
+    volumes:
+      - ./examples/auth.json:/app/examples/auth.json:ro
+    depends_on:
+      - mosquitto
+    networks: [kraken-net]
+
+networks:
+  kraken-net:
+    driver: bridge

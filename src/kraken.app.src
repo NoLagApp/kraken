@@ -1,0 +1,22 @@
+{application, kraken, [
+    {description, "Kraken - pluggable realtime pub/sub proxy (auth, broker, store and control-plane backends)"},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {mod, {kraken_app, []}},
+    {applications, [
+        kernel,
+        stdlib,
+        inets,
+        ssl,
+        cowboy,
+        gun,
+        jsx,
+        msgpack,
+        emqtt,
+        syn
+    ]},
+    {env, []},
+    {modules, []},
+    {licenses, ["Apache-2.0"]},
+    {links, [{"GitHub", "https://github.com/NoLagApp/kraken"}]}
+]}.

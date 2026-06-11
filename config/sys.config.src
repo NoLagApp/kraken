@@ -1,0 +1,64 @@
+[
+    {kraken, [
+        %% Listeners
+        {ws_port, ${WS_PORT}},
+        {mqtt_port, ${MQTT_PORT}},
+
+        %% ------------------------------------------------------------
+        %% Pluggable backends. Short names resolve to built-in modules;
+        %% any other atom is treated as a custom module implementing the
+        %% corresponding behaviour.
+        %%   auth:    static | http | <module>
+        %%   broker:  syn | mqtt | <module>
+        %%   store:   ets | noop | <module>
+        %%   control: noop | http | <module>
+        %% ------------------------------------------------------------
+        {auth_backend, ${AUTH_BACKEND}},
+        {broker_backend, ${BROKER_BACKEND}},
+        {store_backend, ${STORE_BACKEND}},
+        {control_backend, ${CONTROL_BACKEND}},
+
+        %% kraken_auth_static
+        {auth_file, "${AUTH_FILE}"},
+        {auth_allow_all, ${AUTH_ALLOW_ALL}},   %% dev mode: accept any token, full access (INSECURE)
+
+        %% kraken_auth_http / kraken_control_http
+        {auth_http_url, "${AUTH_HTTP_URL}"},
+        {control_http_url, "${CONTROL_HTTP_URL}"},
+        {backend_secret, "${BACKEND_SECRET}"}, %% bearer secret sent to auth/control HTTP backends
+
+        %% kraken_broker_mqtt (any MQTT 3.1.1 broker: EMQX, Mosquitto, VerneMQ, ...)
+        {mqtt_broker_host, "${MQTT_BROKER_HOST}"},
+        {mqtt_broker_port, ${MQTT_BROKER_PORT}},
+        {mqtt_broker_username, "${MQTT_BROKER_USERNAME}"},
+        {mqtt_broker_password, "${MQTT_BROKER_PASSWORD}"},
+
+        %% kraken_store_ets
+        {store_ttl_seconds, ${STORE_TTL_SECONDS}},
+        {store_max_messages, ${STORE_MAX_MESSAGES}},
+
+        %% Message recording on/off (independent of which store backend)
+        {record_messages, ${RECORD_MESSAGES}},
+
+        %% Flat message size ceiling in bytes (payload, msgpack-encoded)
+        {max_message_size, ${MAX_MESSAGE_SIZE}},
+
+        %% HTTP /internal/publish shared secret
+        {internal_secret, "${INTERNAL_SECRET}"},
+
+        %% Clustering: standalone | dns | epmd | gossip
+        {cluster_strategy, ${CLUSTER_STRATEGY}},
+        {cluster_dns_name, "${CLUSTER_DNS_NAME}"},
+        {cluster_hosts, "${CLUSTER_HOSTS}"},
+        {cluster_gossip_port, ${CLUSTER_GOSSIP_PORT}},
+        {cluster_gossip_secret, "${CLUSTER_GOSSIP_SECRET}"}
+    ]},
+
+    {syn, [
+        {scopes, [kraken_presence, kraken_lobbies, kraken_connections, kraken_topics]}
+    ]},
+
+    {kernel, [
+        {net_ticktime, 30}
+    ]}
+].

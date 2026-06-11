@@ -1,0 +1,21 @@
+# rebar3 / Erlang
+_build/
+rebar.lock
+*.beam
+*.dump
+erl_crash.dump
+.rebar3/
+_checkouts/
+doc/
+
+# editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# node (e2e tooling)
+node_modules/
+
+# local env
+.env

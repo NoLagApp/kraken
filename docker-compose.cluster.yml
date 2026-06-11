@@ -1,0 +1,57 @@
+# 3-node cluster using the built-in syn broker (epmd strategy).
+# Demonstrates cross-node fan-out without any external broker.
+#
+# Note: Erlang longnames (-name) require fully-qualified (dotted)
+# hostnames, hence the *.cluster.local network aliases.
+services:
+  kraken1:
+    build: .
+    container_name: kraken1
+    ports:
+      - "8081:8080"
+    environment:
+      - ERLANG_NODE_NAME=kraken@kraken1.cluster.local
+      - ERLANG_COOKIE=kraken_cluster_cookie
+      - CLUSTER_STRATEGY=epmd
+      - CLUSTER_HOSTS=kraken@kraken1.cluster.local,kraken@kraken2.cluster.local,kraken@kraken3.cluster.local
+    volumes:
+      - ./examples/auth.json:/app/examples/auth.json:ro
+    networks:
+      kraken-net:
+        aliases: [kraken1.cluster.local]
+
+  kraken2:
+    build: .
+    container_name: kraken2
+    ports:
+      - "8082:8080"
+    environment:
+      - ERLANG_NODE_NAME=kraken@kraken2.cluster.local
+      - ERLANG_COOKIE=kraken_cluster_cookie
+      - CLUSTER_STRATEGY=epmd
+      - CLUSTER_HOSTS=kraken@kraken1.cluster.local,kraken@kraken2.cluster.local,kraken@kraken3.cluster.local
+    volumes:
+      - ./examples/auth.json:/app/examples/auth.json:ro
+    networks:
+      kraken-net:
+        aliases: [kraken2.cluster.local]
+
+  kraken3:
+    build: .
+    container_name: kraken3
+    ports:
+      - "8083:8080"
+    environment:
+      - ERLANG_NODE_NAME=kraken@kraken3.cluster.local
+      - ERLANG_COOKIE=kraken_cluster_cookie
+      - CLUSTER_STRATEGY=epmd
+      - CLUSTER_HOSTS=kraken@kraken1.cluster.local,kraken@kraken2.cluster.local,kraken@kraken3.cluster.local
+    volumes:
+      - ./examples/auth.json:/app/examples/auth.json:ro
+    networks:
+      kraken-net:
+        aliases: [kraken3.cluster.local]
+
+networks:
+  kraken-net:
+    driver: bridge

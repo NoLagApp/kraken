@@ -1,0 +1,14 @@
+## Node name (-name for multi-host clustering, -sname for single host)
+-name ${ERLANG_NODE_NAME}
+
+## Cookie for distributed erlang (same across all nodes in a cluster)
+-setcookie ${ERLANG_COOKIE}
+
+-smp auto
++A 64
++P 1000000
++Q 65536
+
+## Erlang distribution port range (for firewall rules)
+-kernel inet_dist_listen_min 9100
+-kernel inet_dist_listen_max 9200
