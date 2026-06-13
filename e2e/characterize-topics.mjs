@@ -109,10 +109,13 @@ console.log(`topic-resolution characterization against ${URL}\n`);
   } else {
     fail("C: unknown room rejected with not_authorized", `errors=[${errors}]`);
   }
-  // CURRENT (lying) SDK behavior: callback reports success despite rejection.
-  // Post-M2: flip — callback must receive the error.
-  if (subCb === "cb(null)") ok("C2: subscribe callback lies with cb(null) despite rejection (CURRENT BUG — must flip post-M2)");
-  else fail("C2: expected lying cb(null) under current behavior", String(subCb));
+  // FIXED (M2): the subscribe callback receives the broker's rejection
+  // instead of optimistically reporting success.
+  if (typeof subCb === "string" && subCb.startsWith("err:") && subCb.includes("not_authorized")) {
+    ok("C2: subscribe callback receives the rejection (loud SDK)");
+  } else {
+    fail("C2: subscribe callback must receive the rejection", String(subCb));
+  }
 
   exact.disconnect();
 }
