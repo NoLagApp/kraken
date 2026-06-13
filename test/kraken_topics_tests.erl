@@ -74,12 +74,3 @@ resolve_exact_without_internal_topic_degrades_to_wildcard_test() ->
 legacy_fallback_test() ->
     %% The pre-fix name, kept only for the one-release dual-subscribe shim
     ?assertEqual(<<"unknown/app/room/x">>, kraken_topics:legacy_fallback_topic(undefined, <<"app/room/x">>)).
-
-room_cache_test() ->
-    {ok, _Pid} = kraken_topics:start_link(),
-    ?assertEqual(not_found, kraken_topics:cached_room(<<"app-1">>, <<"room-z">>)),
-    Entries = [exact_rule()],
-    ok = kraken_topics:cache_room(<<"app-1">>, <<"room-z">>, Entries),
-    ?assertEqual({ok, Entries}, kraken_topics:cached_room(<<"app-1">>, <<"room-z">>)),
-    ?assertEqual(not_found, kraken_topics:cached_room(<<"app-1">>, <<"other">>)),
-    gen_server:stop(kraken_topics).

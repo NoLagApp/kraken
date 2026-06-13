@@ -747,17 +747,14 @@ handle_message(#{<<"type">> := <<"subscribe">>, <<"topic">> := Pattern} = Messag
                     {reply, {binary, pack_msg(Response)}, NewState}
             end;
         false ->
-            %% Unknown room for an app this actor can otherwise access?
-            %% Try auto-provisioning via the control plane, then retry once
-            %% (the merged entries make the retry deterministic).
-            case try_autoprovision(EffectivePattern, State) of
-                {ok, State2} ->
-                    handle_message(Message, State2);
-                {error, ErrFrame} ->
-                    kraken_log:info("[WS] ACL denied subscribe to ~s - allowed_topics: ~p~n",
-                        [Pattern, [maps:get(<<"pattern">>, T, <<>>) || T <- AllowedTopics]]),
-                    {reply, {binary, pack_msg(ErrFrame#{<<"topic">> => Pattern})}, State}
-            end
+            %% Unknown/unauthorized room → LOUD. Rooms are never created
+            %% implicitly on the data path (that silently hid typo'd and
+            %% asymmetric slugs); they must be provisioned explicitly via the
+            %% control-plane rooms API before use.
+            kraken_log:info("[WS] ACL denied subscribe to ~s - allowed_topics: ~p~n",
+                [Pattern, [maps:get(<<"pattern">>, T, <<>>) || T <- AllowedTopics]]),
+            ErrFrame = unknown_topic_frame(State#state.protocol_version),
+            {reply, {binary, pack_msg(ErrFrame#{<<"topic">> => Pattern})}, State}
     end;
 
 %% Handle unsubscribe message
@@ -1054,15 +1051,12 @@ handle_message(#{<<"type">> := <<"publish">>, <<"topic">> := Pattern, <<"data">>
                             {ok, State1}
                     end;
                 false ->
-                    %% Unknown room for an app this actor can access?
-                    %% Auto-provision and retry once.
-                    case try_autoprovision(EffPubPattern, State1) of
-                        {ok, State2} ->
-                            handle_message(Message, State2);
-                        {error, ErrFrame0} ->
-                            ErrFrame = with_msg_ref(ErrFrame0#{<<"topic">> => Pattern}, Message),
-                            {reply, {binary, pack_msg(ErrFrame)}, State1}
-                    end
+                    %% Unknown/unauthorized room → LOUD (no implicit creation
+                    %% on the data path; provision rooms via the control plane).
+                    ErrFrame = with_msg_ref(
+                        (unknown_topic_frame(State1#state.protocol_version))#{<<"topic">> => Pattern},
+                        Message),
+                    {reply, {binary, pack_msg(ErrFrame)}, State1}
             end
             end %% end is_project_blocked
             end %% end message_size check
@@ -1893,89 +1887,19 @@ with_msg_ref(Frame, Message) ->
         _ -> Frame
     end.
 
-%% Attempt to auto-provision an unknown room via the control plane.
-%% Only for patterns whose app segment matches an app this actor already
-%% has access to; everything else stays not_authorized. On success the
-%% returned allowed_topics entries are cached node-wide and merged into
-%% this connection's state so the caller can retry the operation.
-try_autoprovision(EffectivePattern, #state{apps = Apps,
-                                           project_id = ProjectId,
-                                           actor_token_id = ActorTokenId,
-                                           scope_slug = ScopeSlug,
-                                           protocol_version = PV} = State) ->
-    case pattern_app_and_room(EffectivePattern, ScopeSlug, Apps) of
-        {ok, AppId, RoomSlug} ->
-            Result = case kraken_topics:cached_room(AppId, RoomSlug) of
-                {ok, Cached} -> {ok, Cached};
-                not_found ->
-                    case kraken_control:ensure_room(ProjectId, AppId, RoomSlug, ActorTokenId) of
-                        {ok, New} when is_list(New), New =/= [] ->
-                            kraken_topics:cache_room(AppId, RoomSlug, New),
-                            {ok, New};
-                        {ok, _} -> {error, empty_provision};
-                        {error, Why} -> {error, Why}
-                    end
-            end,
-            case Result of
-                {ok, Entries} ->
-                    kraken_log:info("[WS] Auto-provisioned room ~s/~s for actor ~s (~p topic entries)",
-                        [AppId, RoomSlug, ActorTokenId, length(Entries)]),
-                    {ok, State#state{allowed_topics = State#state.allowed_topics ++ Entries}};
-                {error, not_supported} ->
-                    kraken_log:info("[WS] Unknown room ~s/~s — auto-provisioning unsupported (actor ~s)",
-                        [AppId, RoomSlug, ActorTokenId]),
-                    {error, unknown_topic_frame(PV, <<"room is not configured and auto-provisioning is not available on this deployment">>)};
-                {error, quota_exceeded} ->
-                    kraken_log:info("[WS] Unknown room ~s/~s — provisioning quota exceeded (actor ~s)",
-                        [AppId, RoomSlug, ActorTokenId]),
-                    {error, unknown_topic_frame(PV, <<"room auto-provisioning quota exceeded for this app">>)};
-                {error, Reason} ->
-                    kraken_log:error("[WS] Auto-provisioning failed for ~s/~s (actor ~s): ~p",
-                        [AppId, RoomSlug, ActorTokenId, Reason]),
-                    {error, unknown_topic_frame(PV, <<"room is not configured and could not be auto-provisioned">>)}
-            end;
-        no_app ->
-            {error, #{<<"type">> => <<"error">>, <<"error">> => <<"not_authorized">>}}
-    end.
-
-%% Loud unknown-topic error for v2 clients; legacy not_authorized for v1.
-unknown_topic_frame(PV, Hint) when PV >= 2 ->
+%% Loud unknown-topic error. v2 clients get a 42940 with an actionable
+%% hint; v1 clients keep the legacy not_authorized frame. Rooms are never
+%% created implicitly on the data path — provision them explicitly via the
+%% control-plane rooms API before use.
+unknown_topic_frame(PV) when PV >= 2 ->
     #{
         <<"type">> => <<"error">>,
         <<"code">> => 42940,
         <<"error">> => <<"unknown_topic">>,
-        <<"hint">> => Hint
+        <<"hint">> => <<"room is not configured — provision it via the control-plane rooms API before use">>
     };
-unknown_topic_frame(_PV, _Hint) ->
+unknown_topic_frame(_PV) ->
     #{<<"type">> => <<"error">>, <<"error">> => <<"not_authorized">>}.
-
-%% Parse app slug + room slug out of an effective pattern and match the
-%% app against the actor's app list (by app_name, which is the slug used
-%% as the pattern prefix). Scoped patterns are app/scope/room/topic.
-pattern_app_and_room(EffectivePattern, ScopeSlug, Apps) ->
-    case binary:split(EffectivePattern, <<"/">>, [global]) of
-        [AppSlug, Second, Third | _Rest] ->
-            RoomSlug = case ScopeSlug of
-                S when is_binary(S), S =:= Second -> Third;
-                _ -> Second
-            end,
-            case find_app_by_slug(AppSlug, Apps) of
-                undefined -> no_app;
-                App -> {ok, maps:get(<<"app_id">>, App, <<"unscoped">>), RoomSlug}
-            end;
-        _ ->
-            no_app
-    end.
-
-find_app_by_slug(_Slug, []) ->
-    undefined;
-find_app_by_slug(Slug, [App | Rest]) when is_map(App) ->
-    case maps:get(<<"app_name">>, App, undefined) of
-        Slug -> App;
-        _ -> find_app_by_slug(Slug, Rest)
-    end;
-find_app_by_slug(Slug, [_ | Rest]) ->
-    find_app_by_slug(Slug, Rest).
 
 %% Find the internal topic (room_uuid/topic_name) for a given pattern
 %% Returns the pattern itself if not found (fallback)

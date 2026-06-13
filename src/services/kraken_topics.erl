@@ -20,37 +20,15 @@
 %%   4. no_match  — nothing matches. Callers reject (not_authorized) or
 %%                  attempt auto-provisioning via kraken_control:ensure_room.
 %%
-%% Also owns the per-node room-mapping cache for auto-provisioned rooms:
-%% {AppId, RoomSlug} -> [AllowedTopicEntry]. Connections merge entries
-%% lazily on first touch; the periodic auth revalidation remains the
-%% cross-node backstop.
+%% Stateless: rooms are provisioned explicitly via the control-plane rooms
+%% API, never created implicitly on the data path, so the broker needs no
+%% room cache. Resolution reads only the connection's own allowed_topics.
 %% @end
 %%%-------------------------------------------------------------------
 -module(kraken_topics).
 
--behaviour(gen_server).
-
--export([start_link/0]).
 -export([resolve/2, fallback_topic/2, legacy_fallback_topic/2]).
--export([cache_room/3, cached_room/2]).
 -export([find_rule/2]).
--export([init/1, handle_call/3, handle_cast/2]).
-
--define(TABLE, kraken_room_cache).
-
-%%====================================================================
-%% gen_server (ETS table owner)
-%%====================================================================
-
-start_link() ->
-    gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
-
-init([]) ->
-    ?TABLE = ets:new(?TABLE, [named_table, public, set, {read_concurrency, true}]),
-    {ok, #{}}.
-
-handle_call(_Msg, _From, State) -> {reply, ok, State}.
-handle_cast(_Msg, State) -> {noreply, State}.
 
 %%====================================================================
 %% Resolution
@@ -127,23 +105,4 @@ rule_app_id(Rule) ->
     case maps:get(<<"app_id">>, Rule, undefined) of
         AppId when is_binary(AppId), AppId =/= <<>> -> AppId;
         _ -> <<"unscoped">>
-    end.
-
-%%====================================================================
-%% Auto-provisioned room cache
-%%====================================================================
-
-%% Cache the allowed_topics entries returned by a successful
-%% kraken_control:ensure_room round-trip.
--spec cache_room(binary(), binary(), [map()]) -> ok.
-cache_room(AppId, RoomSlug, Entries) when is_list(Entries) ->
-    ets:insert(?TABLE, {{AppId, RoomSlug}, Entries, erlang:system_time(second)}),
-    ok.
-
-%% Look up cached entries for an auto-provisioned room.
--spec cached_room(binary(), binary()) -> {ok, [map()]} | not_found.
-cached_room(AppId, RoomSlug) ->
-    case ets:lookup(?TABLE, {AppId, RoomSlug}) of
-        [{_, Entries, _}] -> {ok, Entries};
-        [] -> not_found
     end.

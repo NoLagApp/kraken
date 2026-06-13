@@ -110,32 +110,33 @@ actors) resolves to an internal MQTT topic via the connection's
    plane (Titus) tokens: every existing room is enumerated as an exact
    pattern mapped to a `room-uuid/topic` internal topic. Exact rules always
    win over wildcard rules.
-2. **Node-local cache of auto-provisioned rooms** (see below).
-3. **Wildcard rule** — patterns matched only by a `+`/`#` rule fall back to
+2. **Wildcard rule** — patterns matched only by a `+`/`#` rule fall back to
    the deterministic app-scoped topic `<app_id>/<effective pattern>`. This
    is the static-auth/OSS path: with wildcard rules on both sides, both
    resolve identically and traffic flows. **Constraint:** rulesets must be
    homogeneous per app — an exact-mapped actor and a wildcard-only actor
    resolve different topics and will not interop (both sides log their
    resolution; mixed configs are an operator error).
-4. **No match** — see auto-provisioning, else `not_authorized` / 42940.
+3. **No match** — `not_authorized` (v1) / `42940 unknown_topic` (v2). The
+   broker **never creates a room implicitly** on the data path.
 
-### Auto-provisioned rooms (dynamic rooms)
+### Dynamic rooms are provisioned explicitly (never on the data path)
 
-When an actor touches a room slug that does not exist, but the pattern's app
-segment matches an app the actor has standing on (explicit app access or an
-open-access app), the broker asks the control plane to create it
-(`ensure_room` → `POST {control_http_url}/rooms/ensure`). On success the
-returned `allowed_topics` entries are cached node-wide (keyed
-`{app_id, room_slug}`), merged into the connection, and the operation is
-retried transparently. This is how per-entity rooms (a matter id, a device
-id) work without pre-provisioning.
+The broker does not create rooms when an unknown slug is touched — that
+silently hid typo'd and asymmetric slugs (publisher and subscriber computing
+different ids both "succeed" into separate empty rooms, surfacing downstream
+as dead realtime). An unknown room is always a **loud** error
+(`42940`/`not_authorized`), delivered to the SDK's subscribe/publish callback.
 
-Failure modes: `403` (no standing) → `not_authorized`; `429` (per-app room
-quota, control-plane `KRAKEN_AUTO_ROOM_CAP`) and any other failure → 42940
-with a hint (v2) / `not_authorized` (v1). Deployments without a control
-plane (static auth, `kraken_control_noop`) return not-supported and keep
-wildcard-fallback semantics.
+Per-entity rooms (a matter id, a device id) are created by the application
+intentionally, at entity-creation time, via the control-plane rooms API
+(`NoLagApi.rooms.ensure(appId, { slug, ... })` → Titus
+`POST .../apps/:appId/rooms/ensure`): idempotent (returns the existing room on
+slug match), gated by the app's `config.autoProvisionRooms` flag (default off,
+so static-topology apps reject runtime creation — a typo loop is loud even on
+the creator side), and capped per app (`KRAKEN_AUTO_ROOM_CAP`, default 1000).
+Everyone else just joins; only the one intentional creator code path makes a
+room, so a divergent slug elsewhere is caught loudly.
 
 ### Rolling-upgrade shim
 

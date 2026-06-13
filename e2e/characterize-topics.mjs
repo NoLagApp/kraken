@@ -13,9 +13,10 @@
 //      (different MQTT topics: internal UUID topic vs <AppId>/<pattern>;
 //       this is the split-brain bug — post-M1 this must either deliver or
 //       fail loudly with 42940)
-//   C. Titus-style exact-only token, unknown room -> not_authorized error
-//      frame, subscribe callback STILL fires cb(null) (the SDK lie — fixed
-//      in M2; post-M1b an app-authorized actor gets auto-provisioning instead)
+//   C. exact-only token, unknown room -> loud error (42940 unknown_topic for
+//      v2 / not_authorized for v1), delivered to the subscribe callback.
+//      Rooms are NEVER created implicitly on the data path (M1b-REV) — they
+//      are provisioned explicitly via the control-plane rooms API.
 //
 // WS Pattern/EffPubPattern asymmetry and WS<->MQTT fallback divergence are
 // code-level findings (kraken_ws_handler.erl:574 vs :940; kraken_mqtt_handler
@@ -93,7 +94,11 @@ console.log(`topic-resolution characterization against ${URL}\n`);
   exact.disconnect(); wild.disconnect(); exact2.disconnect();
 }
 
-// ---------- C. unknown room on exact-only token: loud broker, lying SDK ----------
+// ---------- C. unknown room: loud broker + loud SDK callback ----------
+// Rooms are never created implicitly on the data path (M1b-REV reverted the
+// lazy auto-provision that silently hid typo'd/asymmetric slugs). An unknown
+// room is a loud error: 42940 unknown_topic for v2 clients (with a hint
+// pointing at the control-plane rooms API), not_authorized for v1.
 {
   const exact = client("tok-exact");
   const errors = [];
@@ -104,14 +109,14 @@ console.log(`topic-resolution characterization against ${URL}\n`);
   exact.subscribe("charz/other-room/messages", (err) => { subCb = err ? `err:${err.message}` : "cb(null)"; });
   await sleep(800);
 
-  if (errors.some((m) => m.includes("not_authorized"))) {
-    ok("C: unknown room rejected with not_authorized error frame (broker is loud)");
+  const isLoud = (m) => m.includes("unknown_topic") || m.includes("not_authorized");
+  if (errors.some(isLoud)) {
+    ok("C: unknown room rejected with a loud error frame (broker never silently creates it)");
   } else {
-    fail("C: unknown room rejected with not_authorized", `errors=[${errors}]`);
+    fail("C: unknown room rejected loudly", `errors=[${errors}]`);
   }
-  // FIXED (M2): the subscribe callback receives the broker's rejection
-  // instead of optimistically reporting success.
-  if (typeof subCb === "string" && subCb.startsWith("err:") && subCb.includes("not_authorized")) {
+  // The subscribe callback receives the rejection (no optimistic cb(null)).
+  if (typeof subCb === "string" && subCb.startsWith("err:") && isLoud(subCb)) {
     ok("C2: subscribe callback receives the rejection (loud SDK)");
   } else {
     fail("C2: subscribe callback must receive the rejection", String(subCb));
