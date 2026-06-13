@@ -1,0 +1,54 @@
+name: CI — Compile & Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  compile-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "26"
+          rebar3-version: "3.23"
+
+      - name: Compile
+        run: rebar3 compile
+
+      - name: EUnit
+        run: rebar3 eunit
+
+  e2e:
+    # Wire-protocol e2e against a real node (single-node static-auth compose).
+    # Runs after unit tests on pushes to main.
+    if: github.event_name == 'push'
+    needs: compile-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build js-sdk for the e2e driver
+        run: |
+          git clone --depth 1 https://github.com/${{ github.repository_owner }}/js-sdk ../js-sdk || exit 0
+          cd ../js-sdk && npm ci && npm run build
+
+      - name: Start kraken
+        run: docker compose -f e2e/docker-compose.e2e.yml -p kraken-e2e up -d --build
+
+      - name: Wait for healthy
+        run: timeout 90 sh -c 'until docker inspect -f "{{.State.Health.Status}}" kraken-e2e | grep -q healthy; do sleep 2; done'
+
+      - name: Run e2e
+        run: |
+          [ -d ../js-sdk/dist ] || { echo "js-sdk unavailable, skipping e2e"; exit 0; }
+          node e2e/run.mjs
+          node e2e/characterize-topics.mjs
