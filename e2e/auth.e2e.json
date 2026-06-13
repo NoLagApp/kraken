@@ -1,0 +1,94 @@
+{
+  "_comment": "Static auth fixture for e2e/characterize-topics.mjs. tok-wild has only a wildcard rule (always resolves via fallback); tok-exact has an exact pattern with an internal topic mapping (resolves via UUID-style topic); tok-exact2 is a second exact-mapped actor for delivery checks.",
+  "tokens": {
+    "dev-token-alice": {
+      "actorTokenId": "alice",
+      "projectId": "demo-project",
+      "organizationId": "demo-org",
+      "actorType": "user",
+      "rateLimit": 50,
+      "allowedTopics": [
+        {
+          "pattern": "demo/general/#",
+          "topic": "demo-general",
+          "permission": "pubSub",
+          "room_id": "room-general",
+          "room_slug": "general",
+          "app_id": "demo-app",
+          "app_name": "demo"
+        }
+      ]
+    },
+    "dev-token-bob": {
+      "actorTokenId": "bob",
+      "projectId": "demo-project",
+      "organizationId": "demo-org",
+      "actorType": "user",
+      "rateLimit": 50,
+      "allowedTopics": [
+        {
+          "pattern": "demo/general/#",
+          "topic": "demo-general",
+          "permission": "pubSub",
+          "room_id": "room-general",
+          "room_slug": "general",
+          "app_id": "demo-app",
+          "app_name": "demo"
+        }
+      ]
+    },
+    "tok-wild": {
+      "actorTokenId": "wildy",
+      "projectId": "charz-project",
+      "organizationId": "charz-org",
+      "actorType": "user",
+      "rateLimit": 50,
+      "allowedTopics": [
+        {
+          "pattern": "charz/room/#",
+          "permission": "pubSub",
+          "room_id": "room-charz",
+          "room_slug": "room",
+          "app_id": "charz-app",
+          "app_name": "charz"
+        }
+      ]
+    },
+    "tok-exact": {
+      "actorTokenId": "exacty",
+      "projectId": "charz-project",
+      "organizationId": "charz-org",
+      "actorType": "user",
+      "rateLimit": 50,
+      "allowedTopics": [
+        {
+          "pattern": "charz/room/messages",
+          "topic": "room-charz-uuid/messages",
+          "permission": "pubSub",
+          "room_id": "room-charz",
+          "room_slug": "room",
+          "app_id": "charz-app",
+          "app_name": "charz"
+        }
+      ]
+    },
+    "tok-exact2": {
+      "actorTokenId": "exacty2",
+      "projectId": "charz-project",
+      "organizationId": "charz-org",
+      "actorType": "user",
+      "rateLimit": 50,
+      "allowedTopics": [
+        {
+          "pattern": "charz/room/messages",
+          "topic": "room-charz-uuid/messages",
+          "permission": "pubSub",
+          "room_id": "room-charz",
+          "room_slug": "room",
+          "app_id": "charz-app",
+          "app_name": "charz"
+        }
+      ]
+    }
+  }
+}

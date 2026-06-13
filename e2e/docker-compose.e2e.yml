@@ -1,0 +1,14 @@
+# Isolated kraken instance for e2e runs — remapped ports so it can coexist
+# with a dev kraken-proxy stack on the default ports.
+# Usage: docker compose -f e2e/docker-compose.e2e.yml -p kraken-e2e up -d --build
+services:
+  kraken:
+    build: ..
+    container_name: kraken-e2e
+    ports:
+      - "18080:8080" # WebSocket + HTTP (matches e2e/run.mjs default URL)
+      - "11884:1883" # MQTT ingress
+    environment:
+      - AUTH_ALLOW_ALL=${AUTH_ALLOW_ALL:-false}
+    volumes:
+      - ./auth.e2e.json:/app/examples/auth.json:ro
