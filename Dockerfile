@@ -1,7 +1,15 @@
 # Kraken — pluggable realtime pub/sub proxy
 # Multi-stage build for Erlang/OTP
+#
+# IMPORTANT: the builder's Alpine MUST match the runtime Alpine below, or the
+# crypto NIF compiles against one OpenSSL and fails to relocate against the
+# other at boot ("EVP_MD_CTX_get_size_ex: symbol not found" → kernel crash).
+# `erlang:26-alpine` is unpinned and drifts (it moved 3.19→3.20, which is what
+# broke this), and Erlang publishes no per-Alpine tags for OTP 26, so the
+# builder is pinned by DIGEST. This digest = erlang:26-alpine on Alpine 3.20.10
+# (libcrypto 3.3.x); the runtime is alpine:3.20 to match. Bump them together.
 
-FROM erlang:26-alpine AS builder
+FROM erlang@sha256:457edc1accf34eeac729b1ebb52402e80da830bc6d8da64367a834f0c8f3a6b6 AS builder
 
 WORKDIR /app
 
@@ -15,8 +23,8 @@ COPY src/ src/
 
 RUN rebar3 as prod release
 
-# Runtime stage
-FROM alpine:3.19
+# Runtime stage — Alpine version MUST match the builder's (see note above)
+FROM alpine:3.20
 
 RUN apk add --no-cache \
     libstdc++ \
