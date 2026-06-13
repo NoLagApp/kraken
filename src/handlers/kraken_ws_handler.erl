@@ -20,6 +20,7 @@
 %% Rate limiting defaults (messages per second)
 -define(DEFAULT_RATE_LIMIT, 50).
 -define(MAX_MESSAGE_SIZE, 921600).  %% 900KB flat platform ceiling (all plans)
+-define(PROTOCOL_VERSION, 2).  %% v2: loud failures (42940), published acks, auto-provisioned rooms
 -define(MAX_FRAME_SIZE, 1048576).  %% 1MB Cowboy hard cap; ~124KB envelope headroom over the payload ceiling
 
 %% Connection state record
@@ -52,6 +53,9 @@
     rate_limit_second = 0 :: non_neg_integer(),  %% Current second (erlang:system_time(second))
     %% Filter tracking: #{DisplayTopic => [FilterValue]}
     topic_filters = #{} :: map(),
+    %% Negotiated protocol version (1 = legacy silent semantics,
+    %% 2 = loud failures: 42940 unknown_topic, published acks)
+    protocol_version = 1 :: pos_integer(),
     %% Connection limit for this organization
     max_connections = unlimited :: non_neg_integer() | unlimited,
     %% Per-plan message size limit in bytes
@@ -405,6 +409,14 @@ handle_message(#{<<"type">> := <<"auth">>, <<"token">> := Token} = Message, Stat
     %% Absence of reconnect flag = fresh connect (default behavior)
     IsReconnect = maps:get(<<"reconnect">>, Message, false) =:= true,
 
+    %% Protocol version negotiation: absent => 1 (legacy). The negotiated
+    %% version is min(client, server) and is echoed in the auth response.
+    ClientProtocolVersion = case maps:get(<<"protocolVersion">>, Message, 1) of
+        V when is_integer(V), V >= 1 -> V;
+        _ -> 1
+    end,
+    NegotiatedVersion = min(ClientProtocolVersion, ?PROTOCOL_VERSION),
+
     %% Get client-provided projectId for debug logging (pre-auth events)
     %% This is only used for logging purposes, not for authorization
     ClientProjectId = maps:get(<<"projectId">>, Message, undefined),
@@ -471,7 +483,8 @@ handle_message(#{<<"type">> := <<"auth">>, <<"token">> := Token} = Message, Stat
                 session_expiry_seconds = SessionExpiry,
                 scope_slug = ScopeSlug,
                 scope_id = ScopeId,
-                scope_name = ScopeName
+                scope_name = ScopeName,
+                protocol_version = NegotiatedVersion
             },
 
             %% Log connection success to Firestore
@@ -505,6 +518,7 @@ handle_message(#{<<"type">> := <<"auth">>, <<"token">> := Token} = Message, Stat
                 <<"actorTokenId">> => NewState#state.actor_token_id,
                 <<"projectId">> => NewState#state.project_id,
                 <<"actorType">> => NewState#state.actor_type,
+                <<"protocolVersion">> => NegotiatedVersion,
                 <<"restoredSubscriptions">> => ResponseSubs
             },
             {reply, {binary, pack_msg(Response)}, StateWithFilters};
@@ -557,23 +571,23 @@ handle_message(#{<<"type">> := <<"subscribe">>, <<"topic">> := Pattern} = Messag
     EffectivePattern = maybe_inject_scope(Pattern, ScopeSlug, AllowedTopics),
     case kraken_acl:can_subscribe(EffectivePattern, AllowedTopics) of
         true ->
-            %% Find the app for this topic (needed for topic scoping and webhooks)
-            App = kraken_auth:find_app_for_topic(EffectivePattern, Apps),
-            AppId = case App of
-                undefined -> <<"unknown">>;
-                _ -> maps:get(<<"app_id">>, App, <<"unknown">>)
-            end,
-
-            %% Look up the internal topic (room_uuid/topic_name) from allowed topics
-            %% Use EffectivePattern (which includes scope slug if applicable)
-            {InternalTopic, _RoomId} = find_topic_info(EffectivePattern, AllowedTopics),
-            %% Use internal topic for MQTT, or scope by AppId if not found
-            %% IMPORTANT: We must scope by AppId to prevent cross-project message bleed
-            %% when two projects have the same app/room/topic names
-            MqttBaseTopic = case InternalTopic of
-                undefined -> <<AppId/binary, "/", Pattern/binary>>;
-                _ -> InternalTopic
-            end,
+            %% Unified resolution (kraken_topics): exact internal topic, or a
+            %% deterministic app-scoped fallback for wildcard-matched patterns.
+            %% Never the shared `unknown/` namespace, and always keyed on the
+            %% EFFECTIVE pattern so subscribe and publish agree.
+            {MqttBaseTopic, _ResRoomId, AppId, ResKind} =
+                case kraken_topics:resolve(EffectivePattern, AllowedTopics) of
+                    {exact, IT, RId, AId} -> {IT, RId, AId, exact};
+                    {wildcard, FT, AId, _Rule} ->
+                        kraken_log:info("[WS] Wildcard fallback subscribe: ~s -> ~s (actor ~s)",
+                            [EffectivePattern, FT, ActorTokenId]),
+                        {FT, undefined, AId, wildcard};
+                    no_match ->
+                        %% Unreachable when ACL passed, but stay safe
+                        FT0 = kraken_topics:fallback_topic(<<"unscoped">>, EffectivePattern),
+                        {FT0, undefined, <<"unscoped">>, wildcard}
+                end,
+            App = find_app_by_id(AppId, Apps),
 
             %% Check for load balancing option
             LoadBalance = maps:get(<<"loadBalance">>, Message, false) =:= true,
@@ -652,11 +666,12 @@ handle_message(#{<<"type">> := <<"subscribe">>, <<"topic">> := Pattern} = Messag
                             false -> FilterMqttBase
                         end
                     end, NormalizedFilters),
+                    LegacyFilterTopics = legacy_compat_topics(ResKind, EffectivePattern, NormalizedFilters, LoadBalance, LoadBalanceGroup),
                     lists:foreach(fun(FMqttTopic) ->
                         ok = kraken_broker:subscribe(MqttClient, FMqttTopic, Pattern, self(), QoS)
-                    end, FilterMqttTopics),
+                    end, FilterMqttTopics ++ LegacyFilterTopics),
                     NewTF = maps:put(Pattern, FilterList, State#state.topic_filters),
-                    {FilterMqttTopics, State#state{topic_filters = NewTF}};
+                    {FilterMqttTopics ++ LegacyFilterTopics, State#state{topic_filters = NewTF}};
                 {ok, _} ->
                     %% No filters — subscribe to wildcard
                     WildcardTopic = <<MqttBaseTopic/binary, "/#">>,
@@ -664,8 +679,12 @@ handle_message(#{<<"type">> := <<"subscribe">>, <<"topic">> := Pattern} = Messag
                         true -> <<"$share/", LoadBalanceGroup/binary, "/", WildcardTopic/binary>>;
                         false -> WildcardTopic
                     end,
+                    LegacyWildTopics = legacy_compat_topics(ResKind, EffectivePattern, wildcard, LoadBalance, LoadBalanceGroup),
+                    lists:foreach(fun(LT) ->
+                        ok = kraken_broker:subscribe(MqttClient, LT, Pattern, self(), QoS)
+                    end, LegacyWildTopics),
                     ok = kraken_broker:subscribe(MqttClient, WildcardMqttTopic, Pattern, self(), QoS),
-                    {[WildcardMqttTopic], State};
+                    {[WildcardMqttTopic | LegacyWildTopics], State};
                 {error, FilterError} ->
                     %% Invalid filters, return error
                     ErrorResp = #{
@@ -728,14 +747,17 @@ handle_message(#{<<"type">> := <<"subscribe">>, <<"topic">> := Pattern} = Messag
                     {reply, {binary, pack_msg(Response)}, NewState}
             end;
         false ->
-            kraken_log:info("[WS] ACL denied subscribe to ~s - allowed_topics: ~p~n",
-                [Pattern, [maps:get(<<"pattern">>, T, <<>>) || T <- AllowedTopics]]),
-            Response = #{
-                <<"type">> => <<"error">>,
-                <<"error">> => <<"not_authorized">>,
-                <<"topic">> => Pattern
-            },
-            {reply, {binary, pack_msg(Response)}, State}
+            %% Unknown room for an app this actor can otherwise access?
+            %% Try auto-provisioning via the control plane, then retry once
+            %% (the merged entries make the retry deterministic).
+            case try_autoprovision(EffectivePattern, State) of
+                {ok, State2} ->
+                    handle_message(Message, State2);
+                {error, ErrFrame} ->
+                    kraken_log:info("[WS] ACL denied subscribe to ~s - allowed_topics: ~p~n",
+                        [Pattern, [maps:get(<<"pattern">>, T, <<>>) || T <- AllowedTopics]]),
+                    {reply, {binary, pack_msg(ErrFrame#{<<"topic">> => Pattern})}, State}
+            end
     end;
 
 %% Handle unsubscribe message
@@ -892,7 +914,7 @@ handle_message(#{<<"type">> := <<"publish">>, <<"topic">> := Pattern, <<"data">>
                 <<"error">> => <<"rate_limit_exceeded">>,
                 <<"topic">> => Pattern
             },
-            {reply, {binary, pack_msg(Response)}, State1};
+            {reply, {binary, pack_msg(with_msg_ref(Response, Message))}, State1};
         {ok, State1} ->
             %% Check message size against the flat 900KB platform ceiling
             PackedData = msgpack:pack(Data, [{pack_str, from_binary}]),
@@ -906,7 +928,7 @@ handle_message(#{<<"type">> := <<"publish">>, <<"topic">> := Pattern, <<"data">>
                         <<"topic">> => Pattern,
                         <<"maxSizeBytes">> => ?MAX_MESSAGE_SIZE
                     },
-                    {reply, {binary, pack_msg(SizeResponse)}, State1};
+                    {reply, {binary, pack_msg(with_msg_ref(SizeResponse, Message))}, State1};
                 false ->
             %% Check monthly message quota
             case kraken_usage:is_project_blocked(ProjectId) of
@@ -917,29 +939,26 @@ handle_message(#{<<"type">> := <<"publish">>, <<"topic">> := Pattern, <<"data">>
                         <<"error">> => <<"monthly_quota_exceeded">>,
                         <<"topic">> => Pattern
                     },
-                    {reply, {binary, pack_msg(QuotaResponse)}, State1};
+                    {reply, {binary, pack_msg(with_msg_ref(QuotaResponse, Message))}, State1};
                 false ->
             EffPubPattern = maybe_inject_scope(Pattern, ScopeSlug, AllowedTopics),
             case kraken_acl:can_publish(EffPubPattern, AllowedTopics) of
                 true ->
-                    %% Find the app that owns this topic (for AppId and webhook)
-                    App = kraken_auth:find_app_for_topic(EffPubPattern, Apps),
-                    AppId = case App of
-                        undefined -> <<"unknown">>;
-                        _ -> maps:get(<<"app_id">>, App, <<"unknown">>)
-                    end,
-
-                    %% Find the internal topic and room_id from allowed topics
-                    %% Use EffPubPattern (which includes scope slug if applicable)
-                    {InternalTopic, RoomId} = find_topic_info(EffPubPattern, AllowedTopics),
-
-                    %% Use internal topic for MQTT, or scope by AppId if not found
-                    %% IMPORTANT: We must scope by AppId to prevent cross-project message bleed
-                    %% when two projects have the same app/room/topic names
-                    MqttBaseTopic0 = case InternalTopic of
-                        undefined -> <<AppId/binary, "/", EffPubPattern/binary>>;
-                        _ -> InternalTopic
-                    end,
+                    %% Unified resolution — identical to the subscribe path so
+                    %% wildcard-matched publishers and subscribers can never
+                    %% split-brain onto different MQTT topics.
+                    {MqttBaseTopic0, InternalTopic, RoomId, AppId} =
+                        case kraken_topics:resolve(EffPubPattern, AllowedTopics) of
+                            {exact, IT, RId, AId} -> {IT, IT, RId, AId};
+                            {wildcard, FT, AId, _Rule} ->
+                                kraken_log:info("[WS] Wildcard fallback publish: ~s -> ~s (actor ~s)",
+                                    [EffPubPattern, FT, ActorTokenId]),
+                                {FT, undefined, undefined, AId};
+                            no_match ->
+                                FT0 = kraken_topics:fallback_topic(<<"unscoped">>, EffPubPattern),
+                                {FT0, undefined, undefined, <<"unscoped">>}
+                        end,
+                    App = find_app_by_id(AppId, Apps),
 
                     %% Append filter to MQTT topic if specified
                     %% Supports both singular filter (string) and filters (array for AND composite)
@@ -1022,14 +1041,28 @@ handle_message(#{<<"type">> := <<"publish">>, <<"topic">> := Pattern, <<"data">>
                             end
                     end,
 
-                    {ok, State1};
+                    %% v2 publish ack: only when the client supplied a msgRef
+                    case maps:get(<<"msgRef">>, Message, undefined) of
+                        MsgRef when is_binary(MsgRef), MsgRef =/= <<>> ->
+                            AckResp = #{
+                                <<"type">> => <<"published">>,
+                                <<"topic">> => Pattern,
+                                <<"msgRef">> => MsgRef
+                            },
+                            {reply, {binary, pack_msg(AckResp)}, State1};
+                        _ ->
+                            {ok, State1}
+                    end;
                 false ->
-                    Response = #{
-                        <<"type">> => <<"error">>,
-                        <<"error">> => <<"not_authorized">>,
-                        <<"topic">> => Pattern
-                    },
-                    {reply, {binary, pack_msg(Response)}, State1}
+                    %% Unknown room for an app this actor can access?
+                    %% Auto-provision and retry once.
+                    case try_autoprovision(EffPubPattern, State1) of
+                        {ok, State2} ->
+                            handle_message(Message, State2);
+                        {error, ErrFrame0} ->
+                            ErrFrame = with_msg_ref(ErrFrame0#{<<"topic">> => Pattern}, Message),
+                            {reply, {binary, pack_msg(ErrFrame)}, State1}
+                    end
             end
             end %% end is_project_blocked
             end %% end message_size check
@@ -1300,11 +1333,16 @@ restore_subscriptions(MqttClient, [Subscription | Rest], State, WsPid) ->
             {Name, ITopic, LB, LBGroup, SubFilters}
     end,
 
-    %% Find the app for this topic (needed for load balance scoping)
-    App = kraken_auth:find_app_for_topic(Pattern, Apps),
-    AppId = case App of
-        undefined -> <<"unknown">>;
-        _ -> maps:get(<<"app_id">>, App, <<"unknown">>)
+    %% Find the app for this topic (needed for load balance scoping) —
+    %% wildcard-aware so restored wildcard-rule subs scope correctly
+    AppId = case kraken_topics:find_rule(Pattern, AllowedTopics) of
+        {exact, Rule0} -> maps:get(<<"app_id">>, Rule0, <<"unscoped">>);
+        {wildcard, Rule0} -> maps:get(<<"app_id">>, Rule0, <<"unscoped">>);
+        not_found ->
+            case kraken_auth:find_app_for_topic(Pattern, Apps) of
+                undefined -> <<"unscoped">>;
+                App0 -> maps:get(<<"app_id">>, App0, <<"unscoped">>)
+            end
     end,
 
     %% Scope load balance group by project AND app to prevent cross-app collision
@@ -1324,11 +1362,15 @@ restore_subscriptions(MqttClient, [Subscription | Rest], State, WsPid) ->
 
     case kraken_acl:can_subscribe(Pattern, AllowedTopics) of
         true ->
-            %% Use internal topic for MQTT, or scope by AppId if not found
-            %% IMPORTANT: We must scope by AppId to prevent cross-project message bleed
-            %% when two projects have the same app/room/topic names
+            %% Prefer the server-restored internal topic; otherwise resolve
+            %% the same way live subscribes do (never the unknown/ namespace)
             MqttBaseTopic = case InternalTopic of
-                undefined -> <<AppId/binary, "/", Pattern/binary>>;
+                undefined ->
+                    case kraken_topics:resolve(Pattern, AllowedTopics) of
+                        {exact, IT2, _, _} -> IT2;
+                        {wildcard, FT2, _, _} -> FT2;
+                        no_match -> kraken_topics:fallback_topic(AppId, Pattern)
+                    end;
                 _ -> InternalTopic
             end,
             %% Store base topic for filter operations
@@ -1808,6 +1850,132 @@ find_topic_info(Pattern, [AllowedTopic | Rest]) when is_map(AllowedTopic) ->
     end;
 find_topic_info(Pattern, [_Other | Rest]) ->
     find_topic_info(Pattern, Rest).
+
+%% Find an app map by its app_id (wildcard-resolution friendly — the old
+%% exact-pattern lookup returned undefined for wildcard-matched topics).
+find_app_by_id(_AppId, []) ->
+    undefined;
+find_app_by_id(AppId, [App | Rest]) when is_map(App) ->
+    case maps:get(<<"app_id">>, App, undefined) of
+        AppId -> App;
+        _ -> find_app_by_id(AppId, Rest)
+    end;
+find_app_by_id(AppId, [_ | Rest]) ->
+    find_app_by_id(AppId, Rest).
+
+%% One-release dual-subscribe compat shim: wildcard-resolved subscriptions
+%% also listen on the pre-fix fallback topic (`unknown/<pattern>...`) so
+%% publishers on not-yet-upgraded broker nodes still reach upgraded
+%% subscribers during a rolling deploy. Publishing always uses the new
+%% deterministic base. Disable (and later remove) via fallback_compat=false.
+legacy_compat_topics(exact, _EffectivePattern, _Filters, _LB, _LBGroup) ->
+    [];
+legacy_compat_topics(wildcard, EffectivePattern, FiltersOrWildcard, LoadBalance, LoadBalanceGroup) ->
+    case application:get_env(kraken, fallback_compat, true) of
+        false -> [];
+        _ ->
+            LegacyBase = kraken_topics:legacy_fallback_topic(undefined, EffectivePattern),
+            Bases = case FiltersOrWildcard of
+                wildcard -> [<<LegacyBase/binary, "/#">>];
+                Filters when is_list(Filters) ->
+                    [<<LegacyBase/binary, "/", F/binary>> || F <- Filters]
+            end,
+            case LoadBalance of
+                true -> [<<"$share/", LoadBalanceGroup/binary, "/", B/binary>> || B <- Bases];
+                false -> Bases
+            end
+    end.
+
+%% Echo the client's publish msgRef on error frames (v2 publish acks).
+with_msg_ref(Frame, Message) ->
+    case maps:get(<<"msgRef">>, Message, undefined) of
+        MsgRef when is_binary(MsgRef), MsgRef =/= <<>> -> Frame#{<<"msgRef">> => MsgRef};
+        _ -> Frame
+    end.
+
+%% Attempt to auto-provision an unknown room via the control plane.
+%% Only for patterns whose app segment matches an app this actor already
+%% has access to; everything else stays not_authorized. On success the
+%% returned allowed_topics entries are cached node-wide and merged into
+%% this connection's state so the caller can retry the operation.
+try_autoprovision(EffectivePattern, #state{apps = Apps,
+                                           project_id = ProjectId,
+                                           actor_token_id = ActorTokenId,
+                                           scope_slug = ScopeSlug,
+                                           protocol_version = PV} = State) ->
+    case pattern_app_and_room(EffectivePattern, ScopeSlug, Apps) of
+        {ok, AppId, RoomSlug} ->
+            Result = case kraken_topics:cached_room(AppId, RoomSlug) of
+                {ok, Cached} -> {ok, Cached};
+                not_found ->
+                    case kraken_control:ensure_room(ProjectId, AppId, RoomSlug, ActorTokenId) of
+                        {ok, New} when is_list(New), New =/= [] ->
+                            kraken_topics:cache_room(AppId, RoomSlug, New),
+                            {ok, New};
+                        {ok, _} -> {error, empty_provision};
+                        {error, Why} -> {error, Why}
+                    end
+            end,
+            case Result of
+                {ok, Entries} ->
+                    kraken_log:info("[WS] Auto-provisioned room ~s/~s for actor ~s (~p topic entries)",
+                        [AppId, RoomSlug, ActorTokenId, length(Entries)]),
+                    {ok, State#state{allowed_topics = State#state.allowed_topics ++ Entries}};
+                {error, not_supported} ->
+                    kraken_log:info("[WS] Unknown room ~s/~s — auto-provisioning unsupported (actor ~s)",
+                        [AppId, RoomSlug, ActorTokenId]),
+                    {error, unknown_topic_frame(PV, <<"room is not configured and auto-provisioning is not available on this deployment">>)};
+                {error, quota_exceeded} ->
+                    kraken_log:info("[WS] Unknown room ~s/~s — provisioning quota exceeded (actor ~s)",
+                        [AppId, RoomSlug, ActorTokenId]),
+                    {error, unknown_topic_frame(PV, <<"room auto-provisioning quota exceeded for this app">>)};
+                {error, Reason} ->
+                    kraken_log:error("[WS] Auto-provisioning failed for ~s/~s (actor ~s): ~p",
+                        [AppId, RoomSlug, ActorTokenId, Reason]),
+                    {error, unknown_topic_frame(PV, <<"room is not configured and could not be auto-provisioned">>)}
+            end;
+        no_app ->
+            {error, #{<<"type">> => <<"error">>, <<"error">> => <<"not_authorized">>}}
+    end.
+
+%% Loud unknown-topic error for v2 clients; legacy not_authorized for v1.
+unknown_topic_frame(PV, Hint) when PV >= 2 ->
+    #{
+        <<"type">> => <<"error">>,
+        <<"code">> => 42940,
+        <<"error">> => <<"unknown_topic">>,
+        <<"hint">> => Hint
+    };
+unknown_topic_frame(_PV, _Hint) ->
+    #{<<"type">> => <<"error">>, <<"error">> => <<"not_authorized">>}.
+
+%% Parse app slug + room slug out of an effective pattern and match the
+%% app against the actor's app list (by app_name, which is the slug used
+%% as the pattern prefix). Scoped patterns are app/scope/room/topic.
+pattern_app_and_room(EffectivePattern, ScopeSlug, Apps) ->
+    case binary:split(EffectivePattern, <<"/">>, [global]) of
+        [AppSlug, Second, Third | _Rest] ->
+            RoomSlug = case ScopeSlug of
+                S when is_binary(S), S =:= Second -> Third;
+                _ -> Second
+            end,
+            case find_app_by_slug(AppSlug, Apps) of
+                undefined -> no_app;
+                App -> {ok, maps:get(<<"app_id">>, App, <<"unscoped">>), RoomSlug}
+            end;
+        _ ->
+            no_app
+    end.
+
+find_app_by_slug(_Slug, []) ->
+    undefined;
+find_app_by_slug(Slug, [App | Rest]) when is_map(App) ->
+    case maps:get(<<"app_name">>, App, undefined) of
+        Slug -> App;
+        _ -> find_app_by_slug(Slug, Rest)
+    end;
+find_app_by_slug(Slug, [_ | Rest]) ->
+    find_app_by_slug(Slug, Rest).
 
 %% Find the internal topic (room_uuid/topic_name) for a given pattern
 %% Returns the pattern itself if not found (fallback)

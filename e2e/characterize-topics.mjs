@@ -67,11 +67,16 @@ console.log(`topic-resolution characterization against ${URL}\n`);
   wild.emit("charz/room/messages", { b: 2 }); // falls back to charz-app/charz/room/messages
   await sleep(800);
 
-  // CURRENT (buggy) behavior: blackhole. Post-M1: flip this expectation —
-  // unified resolution must make this deliver (wildcard side resolves the
-  // same internal topic via wildcard-aware lookup) or reject loudly.
-  if (exactGot.length === 0) ok("B: exact-subscriber misses wildcard-publisher message (CURRENT BUG — must flip post-M1)");
-  else fail("B: expected blackhole under current behavior", `delivered ${exactGot.length}`);
+  // DOCUMENTED CONSTRAINT (post-unified-resolution): two actors whose
+  // rulesets disagree about a pattern (one exact-mapped, one wildcard-only)
+  // still resolve different topics — resolution is per-connection and cannot
+  // see another actor's mappings. Within an app, either all actors get exact
+  // room mappings (Titus always does this) or none do (static-auth wildcard
+  // configs). Mixed configs are operator error; both sides now LOG their
+  // fallback loudly (kraken_log wildcard-fallback lines) instead of failing
+  // silently. See PROTOCOL.md "Topic resolution".
+  if (exactGot.length === 0) ok("B: mixed exact/wildcard rulesets do not interop (documented constraint, loud logs)");
+  else fail("B: mixed rulesets unexpectedly delivered", `delivered ${exactGot.length}`);
 
   // Sanity: exact<->exact delivers via the internal topic
   const exact2 = client("tok-exact2");

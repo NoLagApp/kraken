@@ -28,6 +28,7 @@ init([]) ->
         worker(kraken_log, []),
         worker(kraken_cluster, []),
         worker(kraken_lobby_map, []),
+        worker(kraken_topics, []),
         worker(kraken_usage, []),
         worker(kraken_subscriptions, [])
     ],

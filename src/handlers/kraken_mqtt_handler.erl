@@ -229,17 +229,25 @@ handle_packet({subscribe, PacketId, Topics}, #state{authenticated = true, socket
     ReturnCodes = lists:map(fun({Topic, RequestedQoS}) ->
         case kraken_acl:can_subscribe(Topic, AllowedTopics) of
             true ->
-                %% Look up internal topic
-                {InternalTopic, _RoomId} = find_topic_info(Topic, AllowedTopics),
-                MqttTopic = case InternalTopic of
-                    undefined -> Topic;
-                    _ -> InternalTopic
+                %% Unified resolution — identical to the WS handler so MQTT
+                %% and WS clients on the same wildcard rule share one topic
+                %% (previously MQTT used the bare pattern and split-brained)
+                MqttTopic = case kraken_topics:resolve(Topic, AllowedTopics) of
+                    {exact, IT, _RId, _AId} -> IT;
+                    {wildcard, FT, _AId, _Rule} ->
+                        kraken_log:info("[MQTT] Wildcard fallback subscribe: ~s -> ~s (actor ~s)",
+                            [Topic, FT, ActorTokenId]),
+                        FT;
+                    no_match ->
+                        kraken_topics:fallback_topic(<<"unscoped">>, Topic)
                 end,
                 GrantedQoS = min(RequestedQoS, 2),
                 ok = kraken_broker:subscribe(MqttClient, MqttTopic, Topic, self(), GrantedQoS),
                 kraken_subscriptions:track(ActorTokenId, Topic, subscribe),
                 GrantedQoS;
             false ->
+                kraken_log:info("[MQTT] SUBACK failure for ~s (actor ~s): not authorized or room not configured",
+                    [Topic, ActorTokenId]),
                 failure
         end
     end, Topics),
@@ -295,19 +303,19 @@ handle_packet({publish, PublishData}, #state{authenticated = true, socket = Sock
         {ok, State1} ->
             case kraken_acl:can_publish(Topic, AllowedTopics) of
                 true ->
-                    %% Find internal topic
-                    {InternalTopic, RoomId} = find_topic_info(Topic, AllowedTopics),
-                    MqttTopic = case InternalTopic of
-                        undefined -> Topic;
-                        _ -> InternalTopic
-                    end,
-
-                    %% Find app for logging context
-                    App = kraken_auth:find_app_for_topic(Topic, Apps),
-                    AppId = case App of
-                        undefined -> undefined;
-                        _ -> maps:get(<<"app_id">>, App, undefined)
-                    end,
+                    %% Unified resolution — same base topic as WS publishers
+                    {MqttTopic, InternalTopic, RoomId, AppId} =
+                        case kraken_topics:resolve(Topic, AllowedTopics) of
+                            {exact, IT, RId, AId} -> {IT, IT, RId, AId};
+                            {wildcard, FT, AId, _Rule} ->
+                                kraken_log:info("[MQTT] Wildcard fallback publish: ~s -> ~s (actor ~s)",
+                                    [Topic, FT, ActorTokenId]),
+                                {FT, undefined, undefined, AId};
+                            no_match ->
+                                FT0 = kraken_topics:fallback_topic(<<"unscoped">>, Topic),
+                                {FT0, undefined, undefined, <<"unscoped">>}
+                        end,
+                    _ = Apps,
 
                     %% Log to Firestore if enabled
                     LogContext = #{
@@ -334,7 +342,11 @@ handle_packet({publish, PublishData}, #state{authenticated = true, socket = Sock
 
                     {ok, State1};
                 false ->
-                    %% Still send ack to avoid retry loops
+                    %% MQTT 3.1.1 has no publish NACK. Log loudly so denied
+                    %% publishes stop being invisible; still ack QoS>0 to
+                    %% avoid client retry storms (documented protocol gap).
+                    kraken_log:info("[MQTT] Denied publish to ~s dropped (actor ~s): not authorized or room not configured",
+                        [Topic, ActorTokenId]),
                     case QoS of
                         0 -> ok;
                         1 ->
