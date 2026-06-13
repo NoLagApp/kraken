@@ -1,0 +1,28 @@
+%% rebar.config.script
+%%
+%% Single source of truth for the kraken version is src/kraken.app.src ({vsn,...}).
+%% The relx {release, {kraken, Vsn}, ...} tuple in rebar.config carries a sentinel
+%% placeholder; this script overwrites it with the vsn read from the .app.src so the
+%% version is declared in exactly ONE place. To bump the version, edit ONLY
+%% src/kraken.app.src (and the matching git tag).
+%%
+%% rebar3 binds CONFIG (parsed rebar.config terms) and SCRIPT (this file's path).
+
+AppSrc = filename:join([filename:dirname(SCRIPT), "src", "kraken.app.src"]),
+Vsn = case file:consult(AppSrc) of
+    {ok, [{application, kraken, Props}]} ->
+        case proplists:get_value(vsn, Props) of
+            V when is_list(V) -> V;
+            Other -> erlang:error({invalid_app_vsn, AppSrc, Other})
+        end;
+    Err ->
+        erlang:error({cannot_read_app_vsn, AppSrc, Err})
+end,
+
+Relx0 = proplists:get_value(relx, CONFIG, []),
+Relx1 = lists:map(
+    fun({release, {kraken, _Placeholder}, Apps}) -> {release, {kraken, Vsn}, Apps};
+       (Other) -> Other
+    end, Relx0),
+
+lists:keyreplace(relx, 1, CONFIG, {relx, Relx1}).
