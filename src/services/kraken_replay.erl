@@ -1,231 +1,118 @@
 %%%-------------------------------------------------------------------
-%% @doc Replay Service
-%% Handles message replay on actor reconnect with server-side buffering
-%% to prevent race conditions between replay query and live messages.
+%% @doc Replay service — durable, claim-based replay for LOAD-BALANCED
+%% workers that have scaled to zero.
 %%
-%% Flow:
-%% 1. Actor connects
-%% 2. Create buffer for live messages
-%% 3. Subscribe to topics (messages go to buffer)
-%% 4. Query undelivered messages from Titus
-%% 5. Send REPLAY_START → replayed messages → REPLAY_END
-%% 6. Flush buffer (deduplicated against replayed)
-%% 7. Switch to live delivery
+%% A task published to a shared subscription `$share/<group>/<topic>'
+%% whose group is all-offline is dropped by EMQX. When a member of the
+%% group reconnects (wake-triggered), the ws_handler starts a replay:
+%%
+%% 1. read the group's cursor (resume point)
+%% 2. query kraken_delivery_store:pending/1 for messages in the group's
+%%    room since the cursor (replays from the EXISTING message store —
+%%    no duplicate copy)
+%% 3. atomically CLAIM each candidate (kraken_delivery_store:claim/1);
+%%    only the winning member streams + processes it (exactly-one)
+%% 4. stream replayStart -> claimed messages (isReplay=true) -> replayEnd
+%% 5. advance the group cursor and signal {replay_complete} so the
+%%    ws_handler flushes any live messages buffered during replay
+%%    (deduped against the replayed ids).
+%%
+%% Buffering of live messages during replay is owned by kraken_ws_handler
+%% (#state.replay_buffer + forward_message_with_filter); this module only
+%% drives the query/claim/stream and reports status back to the parent.
 %% @end
 %%%-------------------------------------------------------------------
 -module(kraken_replay).
 
-%% API
--export([
-    start_replay/4,
-    buffer_message/2,
-    is_replaying/1,
-    get_replayed_message_ids/1,
-    cleanup_replay_state/1,
-    handle_replay_complete/3
-]).
+-export([start_replay/4]).
 
--define(REPLAY_STATE_TABLE, replay_state).
-
--record(replay_state, {
-    actor_id :: binary(),
-    app_id :: binary(),
-    buffer :: queue:queue(),  % Messages received during replay
-    replayed_ids :: sets:set(), % Message IDs already replayed (for dedup)
-    status :: buffering | replaying | flushing | done,
-    ws_pid :: pid()
-}).
-
-%%====================================================================
-%% API
-%%====================================================================
-
-%% Initialize replay state for an actor
-%% Called when actor connects and needs replay
+%% Context map: #{group_id, room_id, limit?}
 -spec start_replay(
     ActorId :: binary(),
     AppId :: binary(),
-    Topics :: [binary()] | undefined,
+    Ctx :: map(),
     WsPid :: pid()
-) -> {ok, started} | {error, term()}.
-start_replay(ActorId, AppId, Topics, WsPid) ->
-    %% Initialize replay state
-    State = #replay_state{
-        actor_id = ActorId,
-        app_id = AppId,
-        buffer = queue:new(),
-        replayed_ids = sets:new(),
-        status = buffering,
-        ws_pid = WsPid
-    },
-
-    %% Store in process dictionary (per-connection)
-    put({replay_state, ActorId}, State),
-
-    %% Start async replay process
-    Self = self(),
-    spawn(fun() ->
-        do_replay(ActorId, AppId, Topics, WsPid, Self)
-    end),
-
+) -> {ok, started}.
+start_replay(ActorId, AppId, Ctx, WsPid) ->
+    Parent = self(),
+    spawn(fun() -> do_replay(ActorId, AppId, Ctx, WsPid, Parent) end),
     {ok, started}.
 
-%% Buffer a live message during replay
-%% Returns true if message was buffered, false if not replaying
--spec buffer_message(ActorId :: binary(), Message :: map()) -> boolean().
-buffer_message(ActorId, Message) ->
-    case get({replay_state, ActorId}) of
-        #replay_state{status = Status, buffer = Buffer} = State when Status =:= buffering; Status =:= replaying ->
-            %% Add message to buffer
-            NewBuffer = queue:in(Message, Buffer),
-            put({replay_state, ActorId}, State#replay_state{buffer = NewBuffer}),
-            true;
-        _ ->
-            %% Not replaying, deliver normally
-            false
-    end.
-
-%% Check if actor is currently in replay mode
--spec is_replaying(ActorId :: binary()) -> boolean().
-is_replaying(ActorId) ->
-    case get({replay_state, ActorId}) of
-        #replay_state{status = Status} when Status =/= done ->
-            true;
-        _ ->
-            false
-    end.
-
-%% Get set of replayed message IDs (for external dedup if needed)
--spec get_replayed_message_ids(ActorId :: binary()) -> sets:set().
-get_replayed_message_ids(ActorId) ->
-    case get({replay_state, ActorId}) of
-        #replay_state{replayed_ids = Ids} ->
-            Ids;
-        _ ->
-            sets:new()
-    end.
-
-%% Cleanup replay state after completion
--spec cleanup_replay_state(ActorId :: binary()) -> ok.
-cleanup_replay_state(ActorId) ->
-    erase({replay_state, ActorId}),
-    ok.
-
 %%====================================================================
-%% Internal functions
+%% Internal
 %%====================================================================
 
-%% Perform the actual replay
-do_replay(ActorId, AppId, Topics, WsPid, ParentPid) ->
-    %% Fetch undelivered messages from Titus
-    MaxMessages = 100, % TODO: Get from topic config
-    case kraken_store:get_replay_messages(#{
-        actor_id => ActorId, app_id => AppId,
-        topics => Topics, limit => MaxMessages
-    }) of
-        {ok, Messages, Count} ->
-            %% Update state to replaying
-            update_replay_status(ParentPid, ActorId, replaying),
-
-            %% Collect replayed message IDs for deduplication
-            ReplayedIds = lists:foldl(fun(Msg, Acc) ->
-                MsgId = maps:get(<<"messageId">>, Msg, undefined),
-                case MsgId of
-                    undefined -> Acc;
-                    _ -> sets:add_element(MsgId, Acc)
-                end
-            end, sets:new(), Messages),
-
-            %% Store replayed IDs for dedup
-            update_replayed_ids(ParentPid, ActorId, ReplayedIds),
-
-            %% Send REPLAY_START
-            send_to_ws(WsPid, #{
-                type => <<"replayStart">>,
-                count => Count,
-                oldestTimestamp => get_oldest_timestamp(Messages),
-                newestTimestamp => get_newest_timestamp(Messages)
-            }),
-
-            %% Send replayed messages (with isReplay flag)
-            lists:foreach(fun(Msg) ->
-                send_to_ws(WsPid, Msg#{<<"isReplay">> => true})
-            end, Messages),
-
-            %% Send REPLAY_END
-            send_to_ws(WsPid, #{
-                type => <<"replayEnd">>,
-                replayed => Count
-            }),
-
-            %% Signal parent to flush buffer
-            ParentPid ! {replay_complete, ActorId, ReplayedIds};
-
+do_replay(ActorId, AppId, Ctx, WsPid, Parent) ->
+    GroupId = maps:get(group_id, Ctx),
+    RoomId = maps:get(room_id, Ctx, undefined),
+    Limit = maps:get(limit, Ctx, 100),
+    Cursor = cursor_get(AppId, GroupId),
+    case kraken_delivery_store:pending(#{
+            app_id => AppId, room_id => RoomId, group_id => GroupId,
+            cursor => Cursor, limit => Limit}) of
+        {ok, Candidates} ->
+            Parent ! {update_replay_status, ActorId, replaying},
+            %% Claim each (exactly-one per group). Keep winners in order;
+            %% advance the cursor past every candidate we examined (won or
+            %% lost — a lost one was handled by another member).
+            {WonRev, ReplayedIds, MaxTs} = lists:foldl(
+                fun(Entry, {AccMsgs, AccIds, AccTs}) ->
+                    MsgId = maps:get(message_id, Entry, undefined),
+                    Ts = maps:get(timestamp, Entry, 0),
+                    NewTs = max(Ts, AccTs),
+                    case claim(AppId, GroupId, MsgId, ActorId) of
+                        won  -> {[Entry | AccMsgs], add_id(MsgId, AccIds), NewTs};
+                        lost -> {AccMsgs, AccIds, NewTs}
+                    end
+                end, {[], [], Cursor}, Candidates),
+            Won = lists:reverse(WonRev),
+            Parent ! {update_replayed_ids, ActorId, ReplayedIds},
+            send(WsPid, #{<<"type">> => <<"replayStart">>, <<"count">> => length(Won)}),
+            lists:foreach(fun(Entry) -> send(WsPid, to_frame(Entry)) end, Won),
+            send(WsPid, #{<<"type">> => <<"replayEnd">>, <<"replayed">> => length(Won)}),
+            catch kraken_delivery_store:cursor_set(#{app_id => AppId, group_id => GroupId}, MaxTs),
+            Parent ! {replay_complete, ActorId, ReplayedIds};
         {error, Reason} ->
-            kraken_log:error("[ReplayService] Error fetching replay messages: ~p", [Reason]),
-            %% Send empty replay
-            send_to_ws(WsPid, #{type => <<"replayStart">>, count => 0}),
-            send_to_ws(WsPid, #{type => <<"replayEnd">>, replayed => 0}),
-            ParentPid ! {replay_complete, ActorId, sets:new()}
+            kraken_log:error("[Replay] pending failed for group ~s: ~p", [GroupId, Reason]),
+            send(WsPid, #{<<"type">> => <<"replayStart">>, <<"count">> => 0}),
+            send(WsPid, #{<<"type">> => <<"replayEnd">>, <<"replayed">> => 0}),
+            Parent ! {replay_complete, ActorId, []}
     end.
 
-%% Update replay status in parent process
-update_replay_status(ParentPid, ActorId, Status) ->
-    ParentPid ! {update_replay_status, ActorId, Status}.
+%% Claim a message for this group member. On backend error, fall back to
+%% delivering (at-least-once) — duplicates are caught by consumer-side
+%% idempotency, which is safer than silently dropping a task.
+claim(AppId, GroupId, MsgId, ActorId) ->
+    case catch kraken_delivery_store:claim(#{
+            app_id => AppId, group_id => GroupId,
+            message_id => MsgId, actor_id => ActorId}) of
+        {ok, won} -> won;
+        {ok, lost} -> lost;
+        Other ->
+            kraken_log:error("[Replay] claim error for ~s/~s: ~p", [GroupId, MsgId, Other]),
+            won
+    end.
 
-%% Update replayed IDs in parent process
-update_replayed_ids(ParentPid, ActorId, ReplayedIds) ->
-    ParentPid ! {update_replayed_ids, ActorId, ReplayedIds}.
+cursor_get(AppId, GroupId) ->
+    case catch kraken_delivery_store:cursor_get(#{app_id => AppId, group_id => GroupId}) of
+        {ok, Pos} when is_integer(Pos) -> Pos;
+        _ -> 0
+    end.
 
-%% Send message to WebSocket process
-send_to_ws(WsPid, Message) ->
+add_id(undefined, Acc) -> Acc;
+add_id(MsgId, Acc) -> [MsgId | Acc].
+
+%% Wire frame for a replayed message — same shape as a normally-forwarded
+%% message (kraken_ws_handler:forward_message_with_id) + isReplay.
+to_frame(Entry) ->
+    #{
+        <<"type">> => <<"message">>,
+        <<"topic">> => maps:get(topic, Entry, undefined),
+        <<"data">> => maps:get(payload, Entry, #{}),
+        <<"msgId">> => maps:get(message_id, Entry, undefined),
+        <<"requiresAck">> => true,
+        <<"isReplay">> => true
+    }.
+
+send(WsPid, Message) ->
     WsPid ! {send_to_client, Message}.
-
-%% Get oldest timestamp from messages
-get_oldest_timestamp([]) ->
-    null;
-get_oldest_timestamp([First | _]) ->
-    maps:get(<<"timestamp">>, First, null).
-
-%% Get newest timestamp from messages
-get_newest_timestamp([]) ->
-    null;
-get_newest_timestamp(Messages) ->
-    Last = lists:last(Messages),
-    maps:get(<<"timestamp">>, Last, null).
-
-%%====================================================================
-%% Message handlers for kraken_ws_handler to call
-%%====================================================================
-
-%% Handle replay_complete message in kraken_ws_handler
-%% Call this from kraken_ws_handler when receiving {replay_complete, ActorId, ReplayedIds}
--spec handle_replay_complete(ActorId :: binary(), ReplayedIds :: sets:set(), WsPid :: pid()) -> ok.
-handle_replay_complete(ActorId, ReplayedIds, WsPid) ->
-    case get({replay_state, ActorId}) of
-        #replay_state{buffer = Buffer} = State ->
-            %% Update status to flushing
-            put({replay_state, ActorId}, State#replay_state{
-                status = flushing,
-                replayed_ids = ReplayedIds
-            }),
-
-            %% Flush buffer (deduplicated)
-            BufferedMessages = queue:to_list(Buffer),
-            NewMessages = lists:filter(fun(Msg) ->
-                MsgId = maps:get(<<"msgId">>, Msg, maps:get(<<"messageId">>, Msg, undefined)),
-                not sets:is_element(MsgId, ReplayedIds)
-            end, BufferedMessages),
-
-            %% Send buffered messages (not replay)
-            lists:foreach(fun(Msg) ->
-                WsPid ! {send_to_client, Msg#{<<"isReplay">> => false}}
-            end, NewMessages),
-
-            %% Mark as done and cleanup
-            put({replay_state, ActorId}, State#replay_state{status = done}),
-            cleanup_replay_state(ActorId),
-            ok;
-        _ ->
-            ok
-    end.

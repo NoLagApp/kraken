@@ -19,6 +19,10 @@ attrs(Id) ->
         <<"organization_id">> => <<"dev-org">>,
         <<"project_id">> => <<"dev-project">>,
         <<"actor_type">> => <<"agent">>,
+        %% Persistent session so a load-balanced subscriber qualifies for
+        %% claim-based durable replay (scale-to-zero) in the E2E.
+        <<"persistent_session">> => true,
+        <<"session_expiry_seconds">> => 3600,
         <<"apps">> => [#{
             <<"app_id">> => <<"dev-app">>,
             <<"app_name">> => <<"dev">>,

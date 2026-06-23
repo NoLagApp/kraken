@@ -351,6 +351,16 @@ websocket_info({replay_complete, ActorId, ReplayedIds}, #state{actor_token_id = 
 websocket_info({send_to_client, Message}, State) ->
     {reply, {binary, pack_msg(Message)}, State};
 
+%% Replay progress (from kraken_replay worker): advance the live-buffering
+%% gate from buffering -> replaying, and record the replayed ids for dedup.
+websocket_info({update_replay_status, ActorId, Status},
+               #state{actor_token_id = ActorId} = State) ->
+    {ok, State#state{replay_state = Status}};
+websocket_info({update_replayed_ids, ActorId, Ids},
+               #state{actor_token_id = ActorId} = State) ->
+    IdList = case is_list(Ids) of true -> Ids; false -> sets:to_list(Ids) end,
+    {ok, State#state{replayed_msg_ids = IdList}};
+
 websocket_info(_Info, State) ->
     {ok, State}.
 
@@ -583,7 +593,7 @@ handle_message(#{<<"type">> := <<"subscribe">>, <<"topic">> := Pattern} = Messag
             %% deterministic app-scoped fallback for wildcard-matched patterns.
             %% Never the shared `unknown/` namespace, and always keyed on the
             %% EFFECTIVE pattern so subscribe and publish agree.
-            {MqttBaseTopic, _ResRoomId, AppId, ResKind} =
+            {MqttBaseTopic, ResRoomId, AppId, ResKind} =
                 case kraken_topics:resolve(EffectivePattern, AllowedTopics) of
                     {exact, IT, RId, AId} -> {IT, RId, AId, exact};
                     {wildcard, FT, AId, _Rule} ->
@@ -747,12 +757,19 @@ handle_message(#{<<"type">> := <<"subscribe">>, <<"topic">> := Pattern} = Messag
                             end
                     end,
 
+                    %% Durable delivery: a load-balanced subscription from a
+                    %% persistent actor that just (re)connected replays the
+                    %% messages its group missed while scaled to zero, claiming
+                    %% each one. Inert unless the delivery_store is enabled.
+                    NewState2 = maybe_start_lb_replay(LoadBalance, ResRoomId, AppId,
+                                                      LoadBalanceGroup, ActorTokenId, NewState),
+
                     Response = #{
                         <<"type">> => <<"subscribed">>,
                         <<"topic">> => Pattern,
                         <<"loadBalance">> => LoadBalance
                     },
-                    {reply, {binary, pack_msg(Response)}, NewState}
+                    {reply, {binary, pack_msg(Response)}, NewState2}
             end;
         false ->
             %% Unknown/unauthorized room → LOUD. Rooms are never created
@@ -1496,6 +1513,24 @@ maybe_log_delivery(FirestoreWriter, MsgId, ActorTokenId, Topic) ->
     Timestamp = erlang:system_time(millisecond),
     kraken_store:log_delivery(FirestoreWriter, MsgId, ActorTokenId, Topic, Timestamp).
 
+%% Start a claim-based durable replay for a load-balanced subscription from a
+%% persistent actor (a scale-to-zero worker draining what its group missed).
+%% Inert unless the delivery_store is enabled; needs a resolved room to scope
+%% the backlog query. Sets replay_state=buffering so live messages arriving
+%% during the replay are buffered + deduped (forward_message_with_filter).
+maybe_start_lb_replay(true, RoomId, AppId, GroupId, ActorId, State)
+  when RoomId =/= undefined ->
+    case State#state.persistent_session andalso kraken_delivery_store:is_enabled() of
+        true ->
+            Ctx = #{group_id => GroupId, room_id => RoomId},
+            catch kraken_replay:start_replay(ActorId, AppId, Ctx, self()),
+            State#state{replay_state = buffering};
+        false ->
+            State
+    end;
+maybe_start_lb_replay(_LoadBalance, _RoomId, _AppId, _GroupId, _ActorId, State) ->
+    State.
+
 %% Forward message to WebSocket client with optional msgId
 forward_message_with_id(Topic, Data, MsgId, State) ->
     Response = case MsgId of
@@ -1781,13 +1816,21 @@ forward_message_with_filter(Topic, Data, MsgId, FilterValue, State) ->
         undefined -> BaseResponse;
         _ -> maps:put(<<"filter">>, FilterValue, BaseResponse)
     end,
-    try
-        Packed = pack_msg(Response),
-        {reply, {binary, Packed}, State}
-    catch
-        Error:Reason:Stacktrace ->
-            kraken_log:error("[WS] ERROR packing message: ~p:~p~n~p~n", [Error, Reason, Stacktrace]),
-            {ok, State}
+    %% Durable replay seam: while a replay is in flight, buffer live messages
+    %% instead of forwarding, so they are deduped against replayed messages and
+    %% flushed (in order) after replayEnd ({replay_complete} handler).
+    case State#state.replay_state of
+        RS when RS =:= buffering; RS =:= replaying ->
+            {ok, State#state{replay_buffer = State#state.replay_buffer ++ [Response]}};
+        _ ->
+            try
+                Packed = pack_msg(Response),
+                {reply, {binary, Packed}, State}
+            catch
+                Error:Reason:Stacktrace ->
+                    kraken_log:error("[WS] ERROR packing message: ~p:~p~n~p~n", [Error, Reason, Stacktrace]),
+                    {ok, State}
+            end
     end.
 
 %% Collect pending filter state from process dictionary after restore_subscriptions
