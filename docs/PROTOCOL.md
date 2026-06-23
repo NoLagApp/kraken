@@ -207,3 +207,56 @@ backend, topics map to ACL patterns via the same unified resolution, QoS 0-2
 supported. Caveats: MQTT 3.1.1 cannot NACK a publish — denied publishes are
 dropped with a broker-side log (and acked at QoS>0 to prevent retry storms);
 subscribe failures surface as SUBACK failure return codes.
+
+## Persistent presence
+
+> Requires a persistence + wake backend (proprietary; see
+> `kraken-proxy/docs/PERSISTENT_PRESENCE.md`). On the OSS `syn` build with no
+> backend wired, `persistent` advertises behave like ordinary ephemeral presence
+> (no durable record, no wake) — the fields below are accepted and ignored.
+
+Ordinary `presence` is socket-bound: the entry is dropped when the connection
+closes. **Persistent presence** lets an actor's presence record (identity +
+advertised capabilities) survive disconnection so it stays discoverable, and be
+**woken on demand** when a message/task is routed to it while offline.
+
+### Client → server (extends `presence`)
+
+| field | meaning |
+|-------|---------|
+| `persistent` | `true` to write a durable presence record (default `false` = today's ephemeral behavior) |
+| `capabilities` | `array<string>` — capability/tool tags, indexed for discovery (`array-contains`) |
+| `advertisement` | map returned verbatim to discoverers: `{ tools, baseUrl, meta }` (no secrets) |
+| `wake` | map: `{ url, timeoutMs }` — HMAC-signed wake endpoint + reconnect deadline. The wake secret is minted server-side and **never echoed back** |
+
+A persistent `presence` write upserts the durable record (`status=online`) and
+also performs the normal live `join`. On socket close the record is **soft-offlined**
+(`status=offline`), not removed; a persistent TTL eventually reaps records that
+never reconnect.
+
+### Server → client
+
+```jsonc
+// presence events gain a status (persistent actors only)
+{ "type": "presence", "event": "join"|"leave"|"update"|"waking",
+  "data": { "actor_token_id": "...", "status": "online"|"offline"|"waking",
+            "presence": {...}, "capabilities": [...], "advertisementVersion": N } }
+
+// presenceList / discovery now includes offline-but-registered actors:
+{ "type": "presenceList", "roomId": "...",
+  "data": [ { "actor_token_id": "...", "status": "online"|"offline"|"waking",
+              "advertisement": {...}, "advertisementVersion": N } ] }
+```
+
+Discovery (`getPresence` / the agents-layer `findAgents`) returns persistent actors
+regardless of live-connection status, tagged with `status`. Routing a task to an
+`offline` persistent actor transitions it to `waking`, queues the task on its
+persistent session (QoS ≥ 1), and fires its wake webhook out-of-band; on reconnect
+the queued task is delivered. Wake delivery is **not** part of the wire protocol —
+it is an outbound server-side webhook (no client frame).
+
+### Errors
+
+| Code | Error |
+|------|-------|
+| 42950 | `wake_failed` (persistent actor was offline and the wake webhook did not produce a reconnect before `wake.timeoutMs`; the task is routed to the DLQ) |

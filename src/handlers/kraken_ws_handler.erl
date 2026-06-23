@@ -63,6 +63,9 @@
     %% Persistent session config (for agent/orchestrator actors)
     persistent_session = false :: boolean(),
     session_expiry_seconds = 3600 :: non_neg_integer(),
+    %% Persistent Presence: true once this connection advertised persistent
+    %% mode, so terminate/3 soft-offlines the durable record instead of dropping it
+    persistent_presence = false :: boolean(),
     %% Access scope for tenant isolation (injected into topic patterns)
     scope_slug :: binary() | undefined,
     scope_id :: binary() | undefined,
@@ -357,6 +360,8 @@ terminate(Reason, _Req, #state{mqtt_client = MqttClient, current_room_id = RoomI
                                 project_id = ProjectId,
                                 authenticated = Authenticated,
                                 subscribed_lobbies = SubscribedLobbies,
+                                persistent_presence = PersistentPresence,
+                                allowed_topics = AllowedTopics,
                                 kraken_store = FirestoreWriter} = _State) ->
     kraken_log:info("[WS] Connection closed~n", []),
 
@@ -381,7 +386,10 @@ terminate(Reason, _Req, #state{mqtt_client = MqttClient, current_room_id = RoomI
     %% Leave room presence group if set
     case RoomId of
         undefined -> ok;
-        _ -> kraken_presence:leave_room_presence(RoomId, ActorTokenId)
+        _ ->
+            kraken_presence:leave_room_presence(RoomId, ActorTokenId),
+            %% Persistent Presence: soft-offline the durable record (kept discoverable + wakeable)
+            pp_offline(PersistentPresence, RoomId, ActorTokenId, AllowedTopics)
     end,
     %% Leave all subscribed lobbies (each entry is {Slug, [UUID]})
     lists:foreach(fun({_Slug, UUIDs}) ->
@@ -1038,6 +1046,11 @@ handle_message(#{<<"type">> := <<"publish">>, <<"topic">> := Pattern, <<"data">>
                             end
                     end,
 
+                    %% Persistent Presence: wake offline persistent subscribers in this room
+                    %% (the message is queued on their persistent session; wake brings them
+                    %% back online to drain it)
+                    pp_wake_offline(RoomId, AppId),
+
                     %% v2 publish ack: only when the client supplied a msgRef
                     case maps:get(<<"msgRef">>, Message, undefined) of
                         MsgRef when is_binary(MsgRef), MsgRef =/= <<>> ->
@@ -1084,7 +1097,11 @@ handle_message(#{<<"type">> := <<"presence">>, <<"roomId">> := RoomSlug, <<"data
             end,
             %% Update presence in new room (using UUID)
             kraken_presence:update_room_presence(RoomId, ActorTokenId, PresenceData, self(), ProjectId),
-            NewState = State#state{presence = PresenceData, current_room_id = RoomId},
+            %% Persistent Presence: write through a durable record when opted in
+            Persistent = pp_write_through(RoomId, ActorTokenId, ProjectId,
+                                          State#state.scope_id, PresenceData, AllowedTopics),
+            NewState = State#state{presence = PresenceData, current_room_id = RoomId,
+                                   persistent_presence = Persistent},
             {ok, NewState}
     end;
 
@@ -1105,7 +1122,9 @@ handle_message(#{<<"type">> := <<"getPresence">>, <<"roomId">> := RoomSlug},
         undefined -> RoomSlug;  %% Fallback to slug if not found
         Uuid -> Uuid
     end,
-    PresenceList = kraken_presence:get_room_presence(ResolvedRoomId),
+    LivePresenceList = kraken_presence:get_room_presence(ResolvedRoomId),
+    %% Persistent Presence: merge offline-but-registered actors into discovery
+    PresenceList = pp_merge_room_presence(LivePresenceList, ResolvedRoomId, AllowedTopics),
     Response = #{
         <<"type">> => <<"presenceList">>,
         <<"roomId">> => RoomSlug,
@@ -1827,6 +1846,111 @@ resolve_room_id(RoomSlug, [AllowedTopic | Rest]) when is_map(AllowedTopic) ->
     end;
 resolve_room_id(RoomSlug, [_ | Rest]) ->
     resolve_room_id(RoomSlug, Rest).
+
+%%====================================================================
+%% Persistent Presence helpers
+%%====================================================================
+
+%% True when the client's presence payload opts into persistent mode.
+pp_is_persistent(PresenceData) when is_map(PresenceData) ->
+    maps:get(<<"persistent">>, PresenceData, false) =:= true;
+pp_is_persistent(_) ->
+    false.
+
+%% Resolve the app_id that owns a room UUID, from allowed_topics.
+pp_room_app_id(_RoomId, []) ->
+    undefined;
+pp_room_app_id(RoomId, [AllowedTopic | Rest]) when is_map(AllowedTopic) ->
+    case maps:get(<<"room_id">>, AllowedTopic, undefined) of
+        RoomId -> maps:get(<<"app_id">>, AllowedTopic, undefined);
+        _ -> pp_room_app_id(RoomId, Rest)
+    end;
+pp_room_app_id(RoomId, [_ | Rest]) ->
+    pp_room_app_id(RoomId, Rest).
+
+%% Build the durable presence record written through to the presence store.
+pp_record(AppId, RoomId, ActorTokenId, ProjectId, ScopeId, PresenceData) ->
+    #{
+        app_id => AppId,
+        room_id => RoomId,
+        actor_token_id => ActorTokenId,
+        project_id => ProjectId,
+        scope_id => ScopeId,
+        node => atom_to_binary(node(), utf8),
+        capabilities => maps:get(<<"capabilities">>, PresenceData, []),
+        advertisement => PresenceData,
+        wake => maps:get(<<"wake">>, PresenceData, undefined)
+    }.
+
+%% Write-through on advertise: persist the record (status online) when the
+%% presence payload opts into persistent mode. Returns whether it was persistent.
+pp_write_through(RoomId, ActorTokenId, ProjectId, ScopeId, PresenceData, AllowedTopics) ->
+    case pp_is_persistent(PresenceData) of
+        false ->
+            false;
+        true ->
+            AppId = pp_room_app_id(RoomId, AllowedTopics),
+            Record = pp_record(AppId, RoomId, ActorTokenId, ProjectId, ScopeId, PresenceData),
+            catch kraken_presence_store:upsert(Record),
+            true
+    end.
+
+%% Soft-offline on disconnect: keep the record (discoverable + wakeable),
+%% just mark it offline. No-op for non-persistent connections.
+pp_offline(false, _RoomId, _ActorTokenId, _AllowedTopics) ->
+    ok;
+pp_offline(true, RoomId, ActorTokenId, AllowedTopics) ->
+    AppId = pp_room_app_id(RoomId, AllowedTopics),
+    catch kraken_presence_store:offline(#{
+        app_id => AppId,
+        room_id => RoomId,
+        actor_token_id => ActorTokenId,
+        node => atom_to_binary(node(), utf8)
+    }),
+    ok.
+
+%% Publish-path gate: wake offline persistent subscribers in a room so they
+%% reconnect and drain the message queued on their persistent broker session.
+%% No-op on the OSS/syn build (discover returns []). The proxy's discover impl
+%% may cache to avoid a per-publish lookup.
+pp_wake_offline(undefined, _AppId) ->
+    ok;
+pp_wake_offline(RoomId, AppId) ->
+    case catch kraken_presence_store:discover(#{room_id => RoomId, app_id => AppId,
+                                                status => <<"offline">>}) of
+        {ok, Actors} when is_list(Actors) ->
+            lists:foreach(
+                fun(Actor) when is_map(Actor) ->
+                        %% mark_waking debounces repeat wakes (status offline -> waking);
+                        %% the proxy's wake backend extracts wake.url from the record and HMAC-POSTs.
+                        catch kraken_presence_store:mark_waking(Actor),
+                        catch kraken_wake:fire(Actor);
+                   (_) ->
+                        ok
+                end, Actors);
+        _ ->
+            ok
+    end.
+
+%% Merge durable persistent records into a room's live presence list so that
+%% discovery (getPresence / the agents-layer findAgents) returns offline-but-
+%% registered actors. Live actors are tagged status=online; durable-only actors
+%% are appended with their stored status. No-op extra on OSS (discover -> []).
+pp_merge_room_presence(LiveList, RoomId, AllowedTopics) ->
+    LiveWithStatus = [maps:put(<<"status">>, <<"online">>, A) || A <- LiveList, is_map(A)],
+    LiveIds = [maps:get(<<"actorTokenId">>, A, undefined) || A <- LiveWithStatus],
+    case catch kraken_presence_store:discover(#{room_id => RoomId,
+                                                app_id => pp_room_app_id(RoomId, AllowedTopics)}) of
+        {ok, Durable} when is_list(Durable) ->
+            Extra = [#{<<"actorTokenId">> => maps:get(<<"actorTokenId">>, D, <<>>),
+                       <<"presence">> => maps:get(<<"presence">>, D, #{}),
+                       <<"status">> => maps:get(<<"status">>, D, <<"offline">>)}
+                    || D <- Durable, is_map(D),
+                       not lists:member(maps:get(<<"actorTokenId">>, D, undefined), LiveIds)],
+            LiveWithStatus ++ Extra;
+        _ ->
+            LiveWithStatus
+    end.
 
 %% Find the internal topic (room_uuid/topic_name) and room_id for a given pattern
 %% Returns {InternalTopic, RoomId} or {undefined, undefined} if not found
