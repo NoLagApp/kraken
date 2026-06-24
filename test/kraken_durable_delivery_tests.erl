@@ -77,6 +77,9 @@ replay_flow_test() ->
     seed(<<"m2">>, <<"room1">>, 200),
     seed(<<"m3">>, <<"room1">>, 300),
     Ctx = #{group_id => <<"g1">>, room_id => <<"room1">>},
+    %% Pre-establish a baseline cursor below the messages; a fresh group (cursor
+    %% 0) baselines at "now" and replays nothing (see baseline_skips_history_test).
+    ok = kraken_delivery_store:cursor_set(#{group_id => <<"g1">>}, 50),
 
     {ok, started} = kraken_replay:start_replay(<<"actorA">>, <<"app1">>, Ctx, self()),
     {FramesA, IdsA} = collect(<<"actorA">>, []),
@@ -96,6 +99,23 @@ replay_flow_test() ->
     {FramesB, IdsB} = collect(<<"actorB">>, []),
     ?assertEqual(0, maps:get(<<"count">>, hd(FramesB))),
     ?assertEqual([], IdsB).
+
+%% A brand-new group (no cursor) baselines at "now" and replays NOTHING — it
+%% must not flood the worker with the room's entire history.
+baseline_skips_history_test() ->
+    setup(),
+    seed(<<"old1">>, <<"room1">>, 100),
+    seed(<<"old2">>, <<"room1">>, 200),
+    Ctx = #{group_id => <<"gnew">>, room_id => <<"room1">>},
+
+    {ok, started} = kraken_replay:start_replay(<<"actorX">>, <<"app1">>, Ctx, self()),
+    {Frames, Ids} = collect(<<"actorX">>, []),
+
+    ?assertEqual(0, maps:get(<<"count">>, hd(Frames))),
+    ?assertEqual([], Ids),
+    %% cursor is now baselined far above the historical messages
+    {ok, Cursor} = kraken_delivery_store:cursor_get(#{group_id => <<"gnew">>}),
+    ?assert(Cursor > 200).
 
 %% Collect everything the replay worker sends until {replay_complete}.
 collect(Actor, Acc) ->

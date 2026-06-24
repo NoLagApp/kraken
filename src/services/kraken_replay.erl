@@ -46,7 +46,22 @@ do_replay(ActorId, AppId, Ctx, WsPid, Parent) ->
     GroupId = maps:get(group_id, Ctx),
     RoomId = maps:get(room_id, Ctx, undefined),
     Limit = maps:get(limit, Ctx, 100),
-    Cursor = cursor_get(AppId, GroupId),
+    case cursor_get(AppId, GroupId) of
+        0 ->
+            %% First time this group is seen (no cursor): baseline it at "now"
+            %% and skip replay. A durable group can only have MISSED messages
+            %% dispatched AFTER it first registered — without this, the first
+            %% reconnect would replay the room's ENTIRE history from time 0.
+            Now = erlang:system_time(millisecond),
+            catch kraken_delivery_store:cursor_set(#{app_id => AppId, group_id => GroupId}, Now),
+            send(WsPid, #{<<"type">> => <<"replayStart">>, <<"count">> => 0}),
+            send(WsPid, #{<<"type">> => <<"replayEnd">>, <<"replayed">> => 0}),
+            Parent ! {replay_complete, ActorId, []};
+        Cursor ->
+            do_replay(ActorId, AppId, GroupId, RoomId, Cursor, Limit, WsPid, Parent)
+    end.
+
+do_replay(ActorId, AppId, GroupId, RoomId, Cursor, Limit, WsPid, Parent) ->
     case kraken_delivery_store:pending(#{
             app_id => AppId, room_id => RoomId, group_id => GroupId,
             cursor => Cursor, limit => Limit}) of
