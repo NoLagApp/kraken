@@ -1560,7 +1560,10 @@ dd_mark_offline_boundary() ->
 %% keyed by pattern, so a later persistent signal can replay it. Needs a
 %% resolved room to scope the backlog query.
 remember_lb_subscription(Pattern, RoomId, AppId, GroupId) when RoomId =/= undefined ->
-    put({lb_subscription, Pattern}, #{group_id => GroupId, room_id => RoomId, app_id => AppId}),
+    %% topic = the subscribed Pattern (the DISPLAY topic the SDK keys its handler
+    %% on); replayed frames must carry it, not the message's internal topic.
+    put({lb_subscription, Pattern},
+        #{group_id => GroupId, room_id => RoomId, app_id => AppId, topic => Pattern}),
     ok;
 remember_lb_subscription(_Pattern, _RoomId, _AppId, _GroupId) ->
     ok.
@@ -1580,13 +1583,14 @@ maybe_replay_lb_subs(State) ->
             ActorId = State#state.actor_token_id,
             Subs = [Ctx || {{lb_subscription, _Pattern}, Ctx} <- get()],
             lists:foldl(
-                fun(#{group_id := GroupId, room_id := RoomId, app_id := AppId}, AccState) ->
+                fun(#{group_id := GroupId, room_id := RoomId, app_id := AppId} = Sub, AccState) ->
                         case get({replay_started, GroupId}) of
                             true ->
                                 AccState;
                             _ ->
                                 put({replay_started, GroupId}, true),
-                                Ctx = #{group_id => GroupId, room_id => RoomId},
+                                Ctx = #{group_id => GroupId, room_id => RoomId,
+                                        topic => maps:get(topic, Sub, undefined)},
                                 catch kraken_replay:start_replay(ActorId, AppId, Ctx, self()),
                                 AccState#state{replay_state = buffering}
                         end

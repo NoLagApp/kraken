@@ -76,7 +76,8 @@ replay_flow_test() ->
     seed(<<"m1">>, <<"room1">>, 100),
     seed(<<"m2">>, <<"room1">>, 200),
     seed(<<"m3">>, <<"room1">>, 300),
-    Ctx = #{group_id => <<"g1">>, room_id => <<"room1">>},
+    %% topic = the subscriber's DISPLAY topic; replayed frames must carry it.
+    Ctx = #{group_id => <<"g1">>, room_id => <<"room1">>, topic => <<"app/echo-workers/tasks">>},
     %% Pre-establish a baseline cursor below the messages; a fresh group (cursor
     %% 0) baselines at "now" and replays nothing (see baseline_skips_history_test).
     ok = kraken_delivery_store:cursor_set(#{group_id => <<"g1">>}, 50),
@@ -90,6 +91,8 @@ replay_flow_test() ->
     MsgsA = [F || F <- FramesA, maps:get(<<"type">>, F) =:= <<"message">>],
     ?assertEqual([<<"m1">>, <<"m2">>, <<"m3">>], [maps:get(<<"msgId">>, F) || F <- MsgsA]),
     lists:foreach(fun(F) -> ?assertEqual(true, maps:get(<<"isReplay">>, F)) end, MsgsA),
+    %% frames carry the subscriber's DISPLAY topic, not the stored internal topic
+    lists:foreach(fun(F) -> ?assertEqual(<<"app/echo-workers/tasks">>, maps:get(<<"topic">>, F)) end, MsgsA),
     End = lists:last(FramesA),
     ?assertEqual(<<"replayEnd">>, maps:get(<<"type">>, End)),
     ?assertEqual(3, length(IdsA)),

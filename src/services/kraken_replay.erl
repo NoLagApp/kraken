@@ -45,6 +45,10 @@ start_replay(ActorId, AppId, Ctx, WsPid) ->
 do_replay(ActorId, AppId, Ctx, WsPid, Parent) ->
     GroupId = maps:get(group_id, Ctx),
     RoomId = maps:get(room_id, Ctx, undefined),
+    %% DISPLAY topic the subscriber registered its handler under (e.g.
+    %% "<app>/<room>/tasks"). Replayed frames MUST carry this, not the message's
+    %% internal UUID topic, or the SDK won't route them to the task handler.
+    DisplayTopic = maps:get(topic, Ctx, undefined),
     Limit = maps:get(limit, Ctx, 100),
     case cursor_get(AppId, GroupId) of
         0 ->
@@ -58,10 +62,10 @@ do_replay(ActorId, AppId, Ctx, WsPid, Parent) ->
             send(WsPid, #{<<"type">> => <<"replayEnd">>, <<"replayed">> => 0}),
             Parent ! {replay_complete, ActorId, []};
         Cursor ->
-            do_replay(ActorId, AppId, GroupId, RoomId, Cursor, Limit, WsPid, Parent)
+            do_replay(ActorId, AppId, GroupId, RoomId, DisplayTopic, Cursor, Limit, WsPid, Parent)
     end.
 
-do_replay(ActorId, AppId, GroupId, RoomId, Cursor, Limit, WsPid, Parent) ->
+do_replay(ActorId, AppId, GroupId, RoomId, DisplayTopic, Cursor, Limit, WsPid, Parent) ->
     case kraken_delivery_store:pending(#{
             app_id => AppId, room_id => RoomId, group_id => GroupId,
             cursor => Cursor, limit => Limit}) of
@@ -83,7 +87,7 @@ do_replay(ActorId, AppId, GroupId, RoomId, Cursor, Limit, WsPid, Parent) ->
             Won = lists:reverse(WonRev),
             Parent ! {update_replayed_ids, ActorId, ReplayedIds},
             send(WsPid, #{<<"type">> => <<"replayStart">>, <<"count">> => length(Won)}),
-            lists:foreach(fun(Entry) -> send(WsPid, to_frame(Entry)) end, Won),
+            lists:foreach(fun(Entry) -> send(WsPid, to_frame(DisplayTopic, Entry)) end, Won),
             send(WsPid, #{<<"type">> => <<"replayEnd">>, <<"replayed">> => length(Won)}),
             catch kraken_delivery_store:cursor_set(#{app_id => AppId, group_id => GroupId}, MaxTs),
             Parent ! {replay_complete, ActorId, ReplayedIds};
@@ -118,11 +122,17 @@ add_id(undefined, Acc) -> Acc;
 add_id(MsgId, Acc) -> [MsgId | Acc].
 
 %% Wire frame for a replayed message — same shape as a normally-forwarded
-%% message (kraken_ws_handler:forward_message_with_id) + isReplay.
-to_frame(Entry) ->
+%% message (kraken_ws_handler:forward_message_with_id) + isReplay. Uses the
+%% subscriber's DISPLAY topic (what its handler is keyed on); falls back to the
+%% message's stored topic only if no display topic was threaded through.
+to_frame(DisplayTopic, Entry) ->
+    Topic = case DisplayTopic of
+        undefined -> maps:get(topic, Entry, undefined);
+        T -> T
+    end,
     #{
         <<"type">> => <<"message">>,
-        <<"topic">> => maps:get(topic, Entry, undefined),
+        <<"topic">> => Topic,
         <<"data">> => maps:get(payload, Entry, #{}),
         <<"msgId">> => maps:get(message_id, Entry, undefined),
         <<"requiresAck">> => true,
