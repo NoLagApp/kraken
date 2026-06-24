@@ -757,12 +757,20 @@ handle_message(#{<<"type">> := <<"subscribe">>, <<"topic">> := Pattern} = Messag
                             end
                     end,
 
-                    %% Durable delivery: a load-balanced subscription from a
-                    %% persistent actor that just (re)connected replays the
-                    %% messages its group missed while scaled to zero, claiming
-                    %% each one. Inert unless the delivery_store is enabled.
-                    NewState2 = maybe_start_lb_replay(LoadBalance, ResRoomId, AppId,
-                                                      LoadBalanceGroup, ActorTokenId, NewState),
+                    %% Durable delivery: remember a load-balanced subscription so a
+                    %% later persistent signal (persistent_session here, OR a
+                    %% persistent-presence advertise) can replay the messages the
+                    %% group missed while scaled to zero, claiming each one. We
+                    %% can't replay at subscribe-only because the SDK advertises
+                    %% persistence AFTER subscribing.
+                    case LoadBalance of
+                        true -> remember_lb_subscription(Pattern, ResRoomId, AppId, LoadBalanceGroup);
+                        false -> ok
+                    end,
+                    NewState2 = case NewState#state.persistent_session of
+                        true -> maybe_replay_lb_subs(NewState);
+                        false -> NewState
+                    end,
 
                     Response = #{
                         <<"type">> => <<"subscribed">>,
@@ -1117,8 +1125,16 @@ handle_message(#{<<"type">> := <<"presence">>, <<"roomId">> := RoomSlug, <<"data
             %% Persistent Presence: write through a durable record when opted in
             Persistent = pp_write_through(RoomId, ActorTokenId, ProjectId,
                                           State#state.scope_id, PresenceData, AllowedTopics),
-            NewState = State#state{presence = PresenceData, current_room_id = RoomId,
-                                   persistent_presence = Persistent},
+            NewState0 = State#state{presence = PresenceData, current_room_id = RoomId,
+                                    persistent_presence = Persistent},
+            %% A persistent-presence advertise is the actor declaring it's a
+            %% durable, wakeable worker — start claim-based replay for any
+            %% load-balanced subscription it made (covers actors whose auth
+            %% doesn't set persistent_session).
+            NewState = case Persistent of
+                true -> maybe_replay_lb_subs(NewState0);
+                false -> NewState0
+            end,
             {ok, NewState}
     end;
 
@@ -1513,23 +1529,42 @@ maybe_log_delivery(FirestoreWriter, MsgId, ActorTokenId, Topic) ->
     Timestamp = erlang:system_time(millisecond),
     kraken_store:log_delivery(FirestoreWriter, MsgId, ActorTokenId, Topic, Timestamp).
 
-%% Start a claim-based durable replay for a load-balanced subscription from a
-%% persistent actor (a scale-to-zero worker draining what its group missed).
-%% Inert unless the delivery_store is enabled; needs a resolved room to scope
-%% the backlog query. Sets replay_state=buffering so live messages arriving
-%% during the replay are buffered + deduped (forward_message_with_filter).
-maybe_start_lb_replay(true, RoomId, AppId, GroupId, ActorId, State)
-  when RoomId =/= undefined ->
-    case State#state.persistent_session andalso kraken_delivery_store:is_enabled() of
-        true ->
-            Ctx = #{group_id => GroupId, room_id => RoomId},
-            catch kraken_replay:start_replay(ActorId, AppId, Ctx, self()),
-            State#state{replay_state = buffering};
+%% Remember a load-balanced subscription's replay context (group/room/app),
+%% keyed by pattern, so a later persistent signal can replay it. Needs a
+%% resolved room to scope the backlog query.
+remember_lb_subscription(Pattern, RoomId, AppId, GroupId) when RoomId =/= undefined ->
+    put({lb_subscription, Pattern}, #{group_id => GroupId, room_id => RoomId, app_id => AppId}),
+    ok;
+remember_lb_subscription(_Pattern, _RoomId, _AppId, _GroupId) ->
+    ok.
+
+%% Start a claim-based durable replay for every load-balanced subscription on
+%% this connection that hasn't replayed yet — a scale-to-zero worker draining
+%% what its group missed. Called when the actor signals it's a durable worker:
+%% persistent_session at subscribe, OR a persistent-presence advertise. Inert
+%% unless the delivery_store is enabled. Sets replay_state=buffering so live
+%% messages arriving during replay are buffered + deduped
+%% (forward_message_with_filter). Dedup per group via {replay_started, Group}.
+maybe_replay_lb_subs(State) ->
+    case kraken_delivery_store:is_enabled() of
         false ->
-            State
-    end;
-maybe_start_lb_replay(_LoadBalance, _RoomId, _AppId, _GroupId, _ActorId, State) ->
-    State.
+            State;
+        true ->
+            ActorId = State#state.actor_token_id,
+            Subs = [Ctx || {{lb_subscription, _Pattern}, Ctx} <- get()],
+            lists:foldl(
+                fun(#{group_id := GroupId, room_id := RoomId, app_id := AppId}, AccState) ->
+                        case get({replay_started, GroupId}) of
+                            true ->
+                                AccState;
+                            _ ->
+                                put({replay_started, GroupId}, true),
+                                Ctx = #{group_id => GroupId, room_id => RoomId},
+                                catch kraken_replay:start_replay(ActorId, AppId, Ctx, self()),
+                                AccState#state{replay_state = buffering}
+                        end
+                end, State, Subs)
+    end.
 
 %% Forward message to WebSocket client with optional msgId
 forward_message_with_id(Topic, Data, MsgId, State) ->
