@@ -401,6 +401,11 @@ terminate(Reason, _Req, #state{mqtt_client = MqttClient, current_room_id = RoomI
             %% Persistent Presence: soft-offline the durable record (kept discoverable + wakeable)
             pp_offline(PersistentPresence, RoomId, ActorTokenId, AllowedTopics)
     end,
+    %% Durable delivery: record the offline boundary (cursor = now) for any
+    %% load-balanced durable subscription, so a reconnecting group member
+    %% replays ONLY messages dispatched while offline — not the window it
+    %% already consumed live.
+    dd_mark_offline_boundary(),
     %% Leave all subscribed lobbies (each entry is {Slug, [UUID]})
     lists:foreach(fun({_Slug, UUIDs}) ->
         lists:foreach(fun(UUID) ->
@@ -1528,6 +1533,28 @@ maybe_log_delivery(_FirestoreWriter, undefined, _ActorTokenId, _Topic) ->
 maybe_log_delivery(FirestoreWriter, MsgId, ActorTokenId, Topic) ->
     Timestamp = erlang:system_time(millisecond),
     kraken_store:log_delivery(FirestoreWriter, MsgId, ActorTokenId, Topic, Timestamp).
+
+%% On disconnect, stamp each load-balanced durable subscription's group cursor
+%% at "now" — the offline boundary. A reconnecting group member then replays
+%% only messages dispatched after this point (what it missed while offline),
+%% instead of re-surfacing the window it already consumed live. For a
+%% scale-to-zero pool (one instance cycling) this disconnect is the group going
+%% offline; multi-instance pools rely on the per-message claim + consumer
+%% idempotency to dedup any overlap. Inert unless the delivery_store is enabled.
+dd_mark_offline_boundary() ->
+    case catch kraken_delivery_store:is_enabled() of
+        true ->
+            Now = erlang:system_time(millisecond),
+            lists:foreach(
+                fun({{lb_subscription, _Pattern}, Ctx}) when is_map(Ctx) ->
+                        catch kraken_delivery_store:cursor_set(
+                            #{app_id => maps:get(app_id, Ctx, <<>>),
+                              group_id => maps:get(group_id, Ctx, <<>>)}, Now);
+                   (_) -> ok
+                end, get());
+        _ ->
+            ok
+    end.
 
 %% Remember a load-balanced subscription's replay context (group/room/app),
 %% keyed by pattern, so a later persistent signal can replay it. Needs a
