@@ -785,14 +785,25 @@ handle_message(#{<<"type">> := <<"subscribe">>, <<"topic">> := Pattern} = Messag
                     {reply, {binary, pack_msg(Response)}, NewState2}
             end;
         false ->
-            %% Unknown/unauthorized room → LOUD. Rooms are never created
-            %% implicitly on the data path (that silently hid typo'd and
-            %% asymmetric slugs); they must be provisioned explicitly via the
-            %% control-plane rooms API before use.
-            kraken_log:info("[WS] ACL denied subscribe to ~s - allowed_topics: ~p~n",
-                [Pattern, [maps:get(<<"pattern">>, T, <<>>) || T <- AllowedTopics]]),
-            ErrFrame = unknown_topic_frame(State#state.protocol_version),
-            {reply, {binary, pack_msg(ErrFrame#{<<"topic">> => Pattern})}, State}
+            %% Cache miss: the room isn't in this connection's cached
+            %% allowed_topics. It may have been created (or granted) AFTER the
+            %% actor connected. Ask the control plane once; on allow, merge and
+            %% re-dispatch so the actor subscribes without reconnecting.
+            case maybe_cache_miss_fallback(ActorTokenId, Pattern, ScopeSlug, AllowedTopics) of
+                {ok, MergedTopics} ->
+                    kraken_log:info("[WS] Cache-miss fallback granted subscribe to ~s (actor ~s)",
+                        [Pattern, ActorTokenId]),
+                    handle_message(Message, State#state{allowed_topics = MergedTopics});
+                deny ->
+                    %% Unknown/unauthorized room → LOUD. Rooms are never created
+                    %% implicitly on the data path (that silently hid typo'd and
+                    %% asymmetric slugs); they must be provisioned explicitly via
+                    %% the control-plane rooms API before use.
+                    kraken_log:info("[WS] ACL denied subscribe to ~s - allowed_topics: ~p~n",
+                        [Pattern, [maps:get(<<"pattern">>, T, <<>>) || T <- AllowedTopics]]),
+                    ErrFrame = unknown_topic_frame(State#state.protocol_version),
+                    {reply, {binary, pack_msg(ErrFrame#{<<"topic">> => Pattern})}, State}
+            end
     end;
 
 %% Handle unsubscribe message
@@ -2207,6 +2218,54 @@ format_disconnect_reason({crash, _Class, _Reason}) -> <<"crash">>;
 format_disconnect_reason({error, closed}) -> <<"client_closed">>;
 format_disconnect_reason({error, Reason}) when is_atom(Reason) -> atom_to_binary(Reason);
 format_disconnect_reason(_Other) -> <<"actor_disconnect">>.
+
+%% Subscribe cache-miss fallback. When an actor subscribes to a room that
+%% isn't in its cached allowed_topics (typically created/granted after it
+%% connected), ask the control plane ONCE whether access is live. On allow,
+%% return the session topics merged with the freshly-resolved room topics so
+%% the retry passes ACL. On deny/error/disabled, fail closed (deny) and
+%% negative-cache the denial to stop a retry storm.
+%%
+%% Re-dispatch safety: we only return {ok, Merged} after re-deriving the
+%% effective pattern (scope-aware) against the merged set and confirming it
+%% now passes can_subscribe. The handle_message re-dispatch therefore always
+%% takes the allow branch — it can never bounce back here and loop.
+maybe_cache_miss_fallback(ActorTokenId, Pattern, ScopeSlug, AllowedTopics) ->
+    case cache_miss_fallback_enabled() of
+        false ->
+            deny;
+        true ->
+            case kraken_acl:deny_cached(ActorTokenId, Pattern) of
+                true -> deny;
+                false -> cache_miss_fallback_check(ActorTokenId, Pattern, ScopeSlug, AllowedTopics)
+            end
+    end.
+
+cache_miss_fallback_check(ActorTokenId, Pattern, ScopeSlug, AllowedTopics) ->
+    case kraken_auth:check_room_access(ActorTokenId, Pattern) of
+        {ok, NewTopics} when is_list(NewTopics), NewTopics =/= [] ->
+            Merged = NewTopics ++ AllowedTopics,
+            %% Titus injects the actor's scope into returned patterns, so the
+            %% effective pattern must be recomputed against the merged set —
+            %% exactly as the allow branch will on re-dispatch.
+            EffectivePattern = maybe_inject_scope(Pattern, ScopeSlug, Merged),
+            case kraken_acl:can_subscribe(EffectivePattern, Merged) of
+                true ->
+                    {ok, Merged};
+                false ->
+                    %% Control plane allowed the room but no returned topic
+                    %% matched the requested pattern — treat as deny.
+                    kraken_acl:deny_cache_insert(ActorTokenId, Pattern),
+                    deny
+            end;
+        _ ->
+            %% Deny, unsupported backend, or transport error → fail closed.
+            kraken_acl:deny_cache_insert(ActorTokenId, Pattern),
+            deny
+    end.
+
+cache_miss_fallback_enabled() ->
+    application:get_env(kraken, cache_miss_fallback_enabled, true) =:= true.
 
 %% Inject scope slug into topic pattern for scoped actors.
 %% Rewrites "app/room/topic" -> "app/scope/room/topic"

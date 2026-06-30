@@ -27,6 +27,20 @@
         {control_http_url, "${CONTROL_HTTP_URL}"},
         {backend_secret, "${BACKEND_SECRET}"}, %% bearer secret sent to auth/control HTTP backends
 
+        %% Subscribe cache-miss fallback (control-plane room-access recheck).
+        %% When enabled, a subscribe to a room NOT in the connection's cached
+        %% allowed_topics makes ONE control-plane check (kraken_auth_http
+        %% check_room_access) instead of an immediate deny — letting an actor
+        %% join a room created/granted AFTER it connected, without reconnecting.
+        %% Fails closed on deny/error and briefly negative-caches the denial.
+        %% On by default — set false to disable (kill-switch). Backends without
+        %% check_room_access (e.g. the static token file) safely no-op (deny on
+        %% miss, as before). Literal (not a ${VAR}) so deployments that don't set
+        %% it can't render an invalid config.
+        {cache_miss_fallback_enabled, true},
+        {cache_miss_fallback_timeout_ms, 2000}, %% per-check HTTP timeout (blocks the actor's conn)
+        {acl_deny_cache_ttl_ms, 5000},           %% negative-cache window for a denied {actor, pattern}
+
         %% kraken_broker_mqtt (any MQTT 3.1.1 broker: EMQX, Mosquitto, VerneMQ, ...)
         {mqtt_broker_host, "${MQTT_BROKER_HOST}"},
         {mqtt_broker_port, ${MQTT_BROKER_PORT}},

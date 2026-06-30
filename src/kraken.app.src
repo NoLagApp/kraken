@@ -1,6 +1,6 @@
 {application, kraken, [
     {description, "Kraken - pluggable realtime pub/sub proxy (auth, broker, store and control-plane backends)"},
-    {vsn, "0.3.2"},
+    {vsn, "0.4.0"},
     {registered, []},
     {mod, {kraken_app, []}},
     {applications, [

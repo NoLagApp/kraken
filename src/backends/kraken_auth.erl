@@ -21,10 +21,17 @@
     {ok, AuthData :: map()} | {error, Reason :: binary()}.
 -callback revalidate_token(ActorTokenId :: binary()) ->
     {ok, AuthData :: map()} | {error, Reason :: binary()} | {retry, Reason :: binary()}.
+%% Optional: live, scoped room-access check for the subscribe cache-miss
+%% fallback. Only the http backend implements it; backends without a control
+%% plane (e.g. the static token file) simply don't, and the fallback no-ops.
+-callback check_room_access(ActorTokenId :: binary(), Pattern :: binary()) ->
+    {ok, AllowedTopics :: list()} | {error, Reason :: binary()}.
+-optional_callbacks([check_room_access/2]).
 
 -export([
     validate_token/1,
     revalidate_token/1,
+    check_room_access/2,
     find_app_for_topic/2,
     %% shared helpers for backends building auth_result maps
     flatten_topics/1, flatten_subscriptions/1, flatten_lobbies/1,
@@ -54,6 +61,17 @@ validate_token(AccessToken) ->
 
 revalidate_token(ActorTokenId) ->
     (backend()):revalidate_token(ActorTokenId).
+
+%% Live room-access check (subscribe cache-miss fallback). Not cached — the
+%% whole point is to read fresh control-plane state for a room that wasn't
+%% known at connect. Backends that don't implement it (no control plane)
+%% return {error, unsupported} so the caller fails closed.
+check_room_access(ActorTokenId, Pattern) ->
+    Backend = backend(),
+    case erlang:function_exported(Backend, check_room_access, 2) of
+        true -> Backend:check_room_access(ActorTokenId, Pattern);
+        false -> {error, <<"unsupported">>}
+    end.
 
 %%====================================================================
 %% Token cache
