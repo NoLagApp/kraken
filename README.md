@@ -52,6 +52,21 @@ BROKER_BACKEND=mqtt MQTT_BROKER_HOST=my-emqx MQTT_BROKER_PORT=1883 docker compos
 (`docker-compose.mqtt.yml` runs this against Mosquitto.) Same wire protocol,
 same SDKs — only the fan-out changes.
 
+## Hosted auth, self-hosted data
+
+Run kraken yourself but let NoLag cloud be the control plane: token validation,
+ACLs, rooms, presence and quota come from NoLag, while the broker and store stay
+on your box, so **NoLag never sees a message payload**. Mint a link key in the
+NoLag portal and:
+
+```bash
+NOLAG_LINK_KEY=nlg_link_xxxx.<secret> docker compose -f docker-compose.cloud.yml up
+```
+
+The middle ground between the `auth.json` quickstart and the fully hosted cloud.
+See [docs/CLOUD.md](docs/CLOUD.md) for exactly what NoLag does and does not
+receive.
+
 ## Features
 
 - **Wire protocol**: MessagePack over WebSocket; see [docs/PROTOCOL.md](docs/PROTOCOL.md)
