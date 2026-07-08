@@ -1089,11 +1089,9 @@ handle_message(#{<<"type">> := <<"publish">>, <<"topic">> := Pattern, <<"data">>
 
                     %% Persistent Presence: wake offline persistent subscribers in this room
                     %% (the message is queued on their persistent session; wake brings them
-                    %% back online to drain it). Spawned off the connection process: the
-                    %% gate does a remote presence-store lookup, and running it inline
-                    %% serializes every publish on that lookup's latency (observed: token
-                    %% streams throttled to one message per store-timeout).
-                    spawn(fun() -> pp_wake_offline(RoomId, AppId) end),
+                    %% back online to drain it). Detached by construction — see the
+                    %% hot-path contract in kraken_presence_store.
+                    kraken_presence_store:wake_offline_async(RoomId, AppId),
 
                     %% v2 publish ack: only when the client supplied a msgRef
                     case maps:get(<<"msgRef">>, Message, undefined) of
@@ -2006,7 +2004,10 @@ pp_record(AppId, RoomId, ActorTokenId, ProjectId, ScopeId, PresenceData) ->
     }.
 
 %% Write-through on advertise: persist the record (status online) when the
-%% presence payload opts into persistent mode. Returns whether it was persistent.
+%% presence payload opts into persistent mode. Returns whether it was
+%% persistent. Detached write — see the hot-path contract in
+%% kraken_presence_store; the advertise frame must not stall on a remote
+%% backend's write latency.
 pp_write_through(RoomId, ActorTokenId, ProjectId, ScopeId, PresenceData, AllowedTopics) ->
     case pp_is_persistent(PresenceData) of
         false ->
@@ -2014,46 +2015,25 @@ pp_write_through(RoomId, ActorTokenId, ProjectId, ScopeId, PresenceData, Allowed
         true ->
             AppId = pp_room_app_id(RoomId, AllowedTopics),
             Record = pp_record(AppId, RoomId, ActorTokenId, ProjectId, ScopeId, PresenceData),
-            catch kraken_presence_store:upsert(Record),
+            kraken_presence_store:upsert_async(Record),
             true
     end.
 
 %% Soft-offline on disconnect: keep the record (discoverable + wakeable),
-%% just mark it offline. No-op for non-persistent connections.
+%% just mark it offline. No-op for non-persistent connections. Detached —
+%% terminate/3 must not hold connection resources on a remote write; a
+%% deploy-scale mass disconnect would serialize every cleanup otherwise.
 pp_offline(false, _RoomId, _ActorTokenId, _AllowedTopics) ->
     ok;
 pp_offline(true, RoomId, ActorTokenId, AllowedTopics) ->
     AppId = pp_room_app_id(RoomId, AllowedTopics),
-    catch kraken_presence_store:offline(#{
+    kraken_presence_store:offline_async(#{
         app_id => AppId,
         room_id => RoomId,
         actor_token_id => ActorTokenId,
         node => atom_to_binary(node(), utf8)
     }),
     ok.
-
-%% Publish-path gate: wake offline persistent subscribers in a room so they
-%% reconnect and drain the message queued on their persistent broker session.
-%% No-op on the OSS/syn build (discover returns []). The proxy's discover impl
-%% may cache to avoid a per-publish lookup.
-pp_wake_offline(undefined, _AppId) ->
-    ok;
-pp_wake_offline(RoomId, AppId) ->
-    case catch kraken_presence_store:discover(#{room_id => RoomId, app_id => AppId,
-                                                status => <<"offline">>}) of
-        {ok, Actors} when is_list(Actors) ->
-            lists:foreach(
-                fun(Actor) when is_map(Actor) ->
-                        %% mark_waking debounces repeat wakes (status offline -> waking);
-                        %% the proxy's wake backend extracts wake.url from the record and HMAC-POSTs.
-                        catch kraken_presence_store:mark_waking(Actor),
-                        catch kraken_wake:fire(Actor);
-                   (_) ->
-                        ok
-                end, Actors);
-        _ ->
-            ok
-    end.
 
 %% Merge durable persistent records into a room's live presence list so that
 %% discovery (getPresence / the agents-layer findAgents) returns offline-but-
