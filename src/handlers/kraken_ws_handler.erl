@@ -1089,8 +1089,11 @@ handle_message(#{<<"type">> := <<"publish">>, <<"topic">> := Pattern, <<"data">>
 
                     %% Persistent Presence: wake offline persistent subscribers in this room
                     %% (the message is queued on their persistent session; wake brings them
-                    %% back online to drain it)
-                    pp_wake_offline(RoomId, AppId),
+                    %% back online to drain it). Spawned off the connection process: the
+                    %% gate does a remote presence-store lookup, and running it inline
+                    %% serializes every publish on that lookup's latency (observed: token
+                    %% streams throttled to one message per store-timeout).
+                    spawn(fun() -> pp_wake_offline(RoomId, AppId) end),
 
                     %% v2 publish ack: only when the client supplied a msgRef
                     case maps:get(<<"msgRef">>, Message, undefined) of
