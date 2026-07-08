@@ -22,6 +22,7 @@
 -define(MAX_MESSAGE_SIZE, 921600).  %% 900KB flat platform ceiling (all plans)
 -define(PROTOCOL_VERSION, 2).  %% v2: loud failures (42940), published acks, auto-provisioned rooms
 -define(MAX_FRAME_SIZE, 1048576).  %% 1MB Cowboy hard cap; ~124KB envelope headroom over the payload ceiling
+-define(ROOM_ACCESS_BREAKER, room_access_fallback).  %% kraken_breaker name for the subscribe cache-miss control-plane check
 
 %% Connection state record
 -record(state, {
@@ -2220,13 +2221,26 @@ maybe_cache_miss_fallback(ActorTokenId, Pattern, ScopeSlug, AllowedTopics) ->
         true ->
             case kraken_acl:deny_cached(ActorTokenId, Pattern) of
                 true -> deny;
-                false -> cache_miss_fallback_check(ActorTokenId, Pattern, ScopeSlug, AllowedTopics)
+                false ->
+                    %% Circuit breaker: while the control plane is unreachable,
+                    %% skip the 2s-timeout check entirely and fail closed, so a
+                    %% reconnect storm during a Titus outage can't stall every
+                    %% connection process for 2s per distinct (actor, pattern).
+                    case kraken_breaker:allow(?ROOM_ACCESS_BREAKER) of
+                        false ->
+                            kraken_acl:deny_cache_insert(ActorTokenId, Pattern),
+                            deny;
+                        true ->
+                            cache_miss_fallback_check(ActorTokenId, Pattern, ScopeSlug, AllowedTopics)
+                    end
             end
     end.
 
 cache_miss_fallback_check(ActorTokenId, Pattern, ScopeSlug, AllowedTopics) ->
     case kraken_auth:check_room_access(ActorTokenId, Pattern) of
         {ok, NewTopics} when is_list(NewTopics), NewTopics =/= [] ->
+            %% Backend answered → healthy, regardless of the access decision.
+            kraken_breaker:record_success(?ROOM_ACCESS_BREAKER),
             Merged = NewTopics ++ AllowedTopics,
             %% Titus injects the actor's scope into returned patterns, so the
             %% effective pattern must be recomputed against the merged set —
@@ -2241,8 +2255,16 @@ cache_miss_fallback_check(ActorTokenId, Pattern, ScopeSlug, AllowedTopics) ->
                     kraken_acl:deny_cache_insert(ActorTokenId, Pattern),
                     deny
             end;
+        {error, <<"connection_failed">>} ->
+            %% Transport error / timeout — the dependency is unhealthy. Count
+            %% it toward tripping the breaker, then fail closed.
+            kraken_breaker:record_failure(?ROOM_ACCESS_BREAKER),
+            kraken_acl:deny_cache_insert(ActorTokenId, Pattern),
+            deny;
         _ ->
-            %% Deny, unsupported backend, or transport error → fail closed.
+            %% Explicit deny, empty allow-list, or unsupported backend: the
+            %% dependency answered (or isn't a breaker concern) → not a failure.
+            kraken_breaker:record_success(?ROOM_ACCESS_BREAKER),
             kraken_acl:deny_cache_insert(ActorTokenId, Pattern),
             deny
     end.

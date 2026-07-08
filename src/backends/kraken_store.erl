@@ -39,7 +39,7 @@
     %% writer-style surface (used by connection handlers)
     log_message/8, log_delivery/5, mark_delivered/4, log_event/2,
     %% logger-style surface (replay + acks)
-    log_message/1, log_message_with_deliveries/2,
+    log_message/1,
     ack_delivery/2, batch_ack_deliveries/2,
     get_replay_messages/1, get_undelivered_count/2
 ]).
@@ -137,22 +137,6 @@ log_message(Message) ->
     case is_enabled() of
         true -> (backend()):log_message(Message);
         false -> {ok, <<"logging_disabled">>}
-    end.
-
-log_message_with_deliveries(Message, ActorIds) ->
-    case is_enabled() of
-        true ->
-            Backend = backend(),
-            Result = Backend:log_message(Message),
-            MessageId = maps:get(message_id, Message, undefined),
-            Now = erlang:system_time(millisecond),
-            [Backend:log_delivery(#{message_id => MessageId, actor_id => A,
-                                    topic => maps:get(topic, Message, undefined),
-                                    delivered_at => Now, status => pending})
-             || A <- ActorIds, MessageId =/= undefined],
-            Result;
-        false ->
-            {ok, <<"logging_disabled">>}
     end.
 
 ack_delivery(MessageId, ActorId) ->
