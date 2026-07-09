@@ -24,6 +24,10 @@ init([]) ->
         period => 60
     },
 
+    %% Own the ACL deny cache from this long-lived supervisor process so it
+    %% can't be created (and later destroyed) by a transient connection.
+    kraken_acl:ensure_deny_cache(),
+
     Base = [
         worker(kraken_log, []),
         worker(kraken_cluster, []),

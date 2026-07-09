@@ -46,7 +46,7 @@
     revalidation_in_progress = false :: boolean(),
     %% Message replay state
     replay_state = none :: none | buffering | replaying | done,
-    replay_buffer = [] :: list(),  %% Messages buffered during replay
+    replay_buffer = queue:new() :: queue:queue(),  %% Messages buffered during replay (O(1) append)
     replayed_msg_ids = [] :: list(),  %% Message IDs already replayed (for dedup)
     %% Rate limiting
     rate_limit = ?DEFAULT_RATE_LIMIT :: non_neg_integer(),
@@ -328,11 +328,12 @@ websocket_info({replay_complete, ActorId, ReplayedIds}, #state{actor_token_id = 
     %% Convert replayed IDs to a set for fast lookup
     ReplayedSet = sets:from_list(ReplayedIds),
 
-    %% Filter buffer to remove already-replayed messages
+    %% Filter buffer to remove already-replayed messages (queue -> list keeps
+    %% insertion order, so buffered messages still flush in the order received)
     NewMessages = lists:filter(fun(Msg) ->
         MsgId = maps:get(<<"msgId">>, Msg, maps:get(<<"messageId">>, Msg, undefined)),
         not sets:is_element(MsgId, ReplayedSet)
-    end, Buffer),
+    end, queue:to_list(Buffer)),
 
     %% Send buffered messages (not replay)
     lists:foreach(fun(Msg) ->
@@ -343,7 +344,7 @@ websocket_info({replay_complete, ActorId, ReplayedIds}, #state{actor_token_id = 
     %% Clear replay state
     NewState = State#state{
         replay_state = done,
-        replay_buffer = [],
+        replay_buffer = queue:new(),
         replayed_msg_ids = ReplayedIds
     },
     {ok, NewState};
@@ -1900,7 +1901,7 @@ forward_message_with_filter(Topic, Data, MsgId, FilterValue, State) ->
     %% flushed (in order) after replayEnd ({replay_complete} handler).
     case State#state.replay_state of
         RS when RS =:= buffering; RS =:= replaying ->
-            {ok, State#state{replay_buffer = State#state.replay_buffer ++ [Response]}};
+            {ok, State#state{replay_buffer = queue:in(Response, State#state.replay_buffer)}};
         _ ->
             try
                 Packed = pack_msg(Response),

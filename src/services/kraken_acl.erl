@@ -5,6 +5,13 @@
 %% only. This module also owns the short-lived negative (deny) cache used by
 %% the WS handler's subscribe cache-miss fallback to throttle repeat control-
 %% plane checks for a recently-denied {actor, pattern}.
+%%
+%% The deny cache is a named ETS table created at boot by kraken_sup, so the
+%% long-lived supervisor owns it. A lazy first-touch create (ensure_deny_cache/0)
+%% would otherwise be owned by whatever transient connection process happened
+%% to hit it first, and vanish on that connection's disconnect — resetting the
+%% cache and badarg-crashing concurrent ACL checks. ensure_deny_cache/0 stays
+%% as a pre-boot/test fallback.
 %% @end
 %%%-------------------------------------------------------------------
 -module(kraken_acl).
@@ -14,7 +21,8 @@
     can_publish/2,
     matches_pattern/2,
     deny_cached/2,
-    deny_cache_insert/2
+    deny_cache_insert/2,
+    ensure_deny_cache/0
 ]).
 
 -define(DENY_CACHE, kraken_acl_deny_cache).
