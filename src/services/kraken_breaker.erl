@@ -16,16 +16,22 @@
 %%   half_open — after the cooldown, allow/1 lets ONE probe through;
 %%               record_success closes, record_failure re-opens.
 %%
-%% All state lives in one public ETS table (lazy-created, like
-%% kraken_acl's deny cache). No process; callers drive transitions via
-%% allow/record_success/record_failure. Lost races on first-use table
-%% creation are swallowed.
+%% All state lives in one public ETS table owned by this supervised
+%% gen_server, so a transient caller (a connection process handling a
+%% subscribe) can't create it and then take it down on disconnect — that
+%% would reset every breaker and badarg concurrent callers exactly during
+%% the churn a breaker is meant to ride out. Callers drive transitions via
+%% the module functions doing direct ETS ops (no gen_server round trip on
+%% the hot path). ensure_table/0 is a lazy fallback for pre-boot / test use.
 %% @end
 %%%-------------------------------------------------------------------
 -module(kraken_breaker).
+-behaviour(gen_server).
 
--export([allow/1, record_success/1, record_failure/1]).
+-export([start_link/0, allow/1, record_success/1, record_failure/1]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
+-define(SERVER, ?MODULE).
 -define(TABLE, kraken_breaker_state).
 -define(DEFAULT_FAILURE_THRESHOLD, 5).
 -define(DEFAULT_COOLDOWN_MS, 10000).
@@ -33,6 +39,9 @@
 %% Per-breaker record: {Name, State, ConsecutiveFailures, OpenedUntil}
 %%   State :: closed | open | half_open
 %%   OpenedUntil :: monotonic ms when the cooldown ends (0 when closed).
+
+start_link() ->
+    gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
 %% Should a call be attempted? Advances open -> half_open once the
 %% cooldown has elapsed, admitting a single probe.
@@ -69,21 +78,34 @@ record_success(Name) ->
 %% The guarded call failed in a way that indicates the dependency is
 %% unhealthy (e.g. a timeout). Count it; trip to open at the threshold,
 %% and re-open immediately on a failed half-open probe.
+%%
+%% The counter bump uses ets:update_counter so concurrent failures — the
+%% exact load the breaker exists for (a reconnect storm against a dead
+%% dependency) — can't lose increments via a read-modify-write race and
+%% leave the breaker closed past its threshold. The open() flip is not
+%% atomic with the increment, but it is idempotent (concurrent trips just
+%% re-stamp the same open state), so that race is harmless.
 -spec record_failure(Name :: atom()) -> ok.
 record_failure(Name) ->
     ensure_table(),
+    %% Guarantee a row exists so update_counter can't badarg. Atomic; a no-op
+    %% if the breaker is already tracked (won't clobber an open/half_open row).
+    ets:insert_new(?TABLE, {Name, closed, 0, 0}),
     case ets:lookup(?TABLE, Name) of
+        [{Name, open, _F, _U}] ->
+            %% Already open — nothing to count.
+            ok;
         [{Name, half_open, _F, _U}] ->
+            %% Probe failed — straight back to open.
             open(Name);
-        [{Name, _State, F, _U}] ->
-            case F + 1 >= failure_threshold() of
+        _ ->
+            %% Closed: atomically increment the consecutive-failure count
+            %% (position 3 of {Name, State, F, OpenedUntil}) and trip at the
+            %% threshold.
+            NewF = ets:update_counter(?TABLE, Name, {3, 1}),
+            case NewF >= failure_threshold() of
                 true -> open(Name);
-                false -> ets:insert(?TABLE, {Name, closed, F + 1, 0})
-            end;
-        [] ->
-            case 1 >= failure_threshold() of
-                true -> open(Name);
-                false -> ets:insert(?TABLE, {Name, closed, 1, 0})
+                false -> ok
             end
     end,
     ok.
@@ -125,3 +147,23 @@ cooldown_ms() ->
         {ok, N} when is_integer(N), N > 0 -> N;
         _ -> ?DEFAULT_COOLDOWN_MS
     end.
+
+%%====================================================================
+%% gen_server — owns the ETS table; no hot-path calls route through it.
+%%====================================================================
+
+init([]) ->
+    ensure_table(),
+    {ok, #{}}.
+
+handle_call(_Request, _From, State) ->
+    {reply, ok, State}.
+
+handle_cast(_Msg, State) ->
+    {noreply, State}.
+
+handle_info(_Info, State) ->
+    {noreply, State}.
+
+terminate(_Reason, _State) ->
+    ok.

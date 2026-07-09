@@ -71,3 +71,27 @@ trip(N) ->
     kraken_breaker:record_failure(N),
     kraken_breaker:record_failure(N),
     kraken_breaker:record_failure(N).
+
+%% Regression for the lost-increment race: 20 processes each record 50
+%% failures concurrently against one breaker with a threshold high enough
+%% that it never trips. The atomic ets:update_counter must land all 1000;
+%% the old read-modify-write dropped increments under contention.
+concurrent_failures_no_lost_increments_test() ->
+    N = concurrent_count,
+    application:set_env(kraken, breaker_failure_threshold, 100000),
+    %% No supervisor in eunit, so touch the breaker once from THIS (long-lived)
+    %% process first: it creates the named ETS table here, so a worker dying
+    %% mid-test can't take the table down with it. In production the supervised
+    %% kraken_breaker gen_server owns the table for the same reason.
+    kraken_breaker:allow(N),
+    Workers = 20,
+    Each = 50,
+    Parent = self(),
+    [spawn(fun() ->
+        [kraken_breaker:record_failure(N) || _ <- lists:seq(1, Each)],
+        Parent ! {done, self()}
+     end) || _ <- lists:seq(1, Workers)],
+    [receive {done, _} -> ok end || _ <- lists:seq(1, Workers)],
+    [{N, closed, F, _}] = ets:lookup(kraken_breaker_state, N),
+    application:unset_env(kraken, breaker_failure_threshold),
+    ?assertEqual(Workers * Each, F).

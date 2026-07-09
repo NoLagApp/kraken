@@ -29,7 +29,8 @@ init([]) ->
         worker(kraken_cluster, []),
         worker(kraken_lobby_map, []),
         worker(kraken_usage, []),
-        worker(kraken_subscriptions, [])
+        worker(kraken_subscriptions, []),
+        worker(kraken_breaker, [])
     ],
 
     AuthPool = http_pool(auth, auth_http_url, kraken_auth_pool),
