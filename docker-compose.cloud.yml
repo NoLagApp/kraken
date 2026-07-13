@@ -1,0 +1,31 @@
+# Kraken in "hosted auth, self-hosted data" mode: coordination + security come
+# from NoLag cloud (token validation, ACLs, quota); the broker fan-out and the
+# message store stay on YOUR box, so NoLag never sees a message payload.
+#
+# Setup is one env var — a link key minted in the NoLag portal
+# ("Connect a self-hosted kraken"):
+#
+#   NOLAG_LINK_KEY=nlg_link_xxxx.<secret> docker compose -f docker-compose.cloud.yml up
+#
+# Point at a different environment with NOLAG_CLOUD_URL, e.g. for dev:
+#   NOLAG_CLOUD_URL=https://api.dev.nolag.app/v1/kraken-link
+#
+# See docs/CLOUD.md for exactly what NoLag does and does not receive.
+services:
+  kraken:
+    build: .
+    container_name: kraken-cloud
+    ports:
+      - "8080:8080"   # WebSocket + HTTP
+      - "1883:1883"   # MQTT ingress
+    environment:
+      # Coordination + security: delegate to NoLag cloud over HTTP.
+      - AUTH_BACKEND=http
+      - CONTROL_BACKEND=http
+      - AUTH_HTTP_URL=${NOLAG_CLOUD_URL:-https://api.nolag.app/v1/kraken-link}
+      - CONTROL_HTTP_URL=${NOLAG_CLOUD_URL:-https://api.nolag.app/v1/kraken-link}
+      # The one secret you paste from the portal. Fails fast if unset.
+      - BACKEND_SECRET=${NOLAG_LINK_KEY:?set NOLAG_LINK_KEY to your link key from the NoLag portal}
+      # Data plane stays local: built-in fan-out + in-memory history/replay.
+      - BROKER_BACKEND=syn
+      - STORE_BACKEND=ets   # local replay; set to noop to disable history entirely
