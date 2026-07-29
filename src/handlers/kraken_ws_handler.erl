@@ -251,29 +251,9 @@ websocket_info({lobby_presence_event, EventType, EventData},
 
 %% Handle revalidation success - update session with new data
 websocket_info({revalidation_success, AuthData}, State) ->
-    NewAllowedTopics = maps:get(allowed_topics, AuthData, State#state.allowed_topics),
-    NewAllowedLobbies = maps:get(allowed_lobbies, AuthData, State#state.allowed_lobbies),
-    NewLobbySlugMap = build_lobby_slug_map(NewAllowedLobbies),
-    NewApps = maps:get(apps, AuthData, State#state.apps),
-    NewMaxConn = maps:get(max_connections, AuthData, State#state.max_connections),
-    NewMaxMsgSize = maps:get(max_message_size_bytes, AuthData, State#state.max_message_size_bytes),
-    NewScopeId = maps:get(scope_id, AuthData, State#state.scope_id),
-    NewScopeSlug = maps:get(scope_slug, AuthData, State#state.scope_slug),
-    NewScopeName = maps:get(scope_name, AuthData, State#state.scope_name),
+    NewState = apply_refreshed_auth(AuthData, State),
     OrgId = State#state.organization_id,
-    NewState = State#state{
-        allowed_topics = NewAllowedTopics,
-        allowed_lobbies = NewAllowedLobbies,
-        lobby_slug_map = NewLobbySlugMap,
-        apps = NewApps,
-        last_validation_at = erlang:timestamp(),
-        revalidation_in_progress = false,
-        max_connections = NewMaxConn,
-        max_message_size_bytes = NewMaxMsgSize,
-        scope_id = NewScopeId,
-        scope_slug = NewScopeSlug,
-        scope_name = NewScopeName
-    },
+    NewMaxConn = NewState#state.max_connections,
     %% Check if org is now over limit after plan downgrade
     case check_connection_limit(OrgId, NewMaxConn) of
         ok ->
@@ -591,6 +571,53 @@ handle_message(#{<<"type">> := <<"auth">>, <<"token">> := Token} = Message, Stat
                 <<"success">> => false,
                 <<"error">> => Reason
             },
+            {reply, {binary, pack_msg(Response)}, State}
+    end;
+
+%% Handle in-band re-authentication: a fresh (client) token extends the
+%% session on the SAME connection - no disconnect, no resubscribe. The new
+%% token MUST resolve to the same actor as the current connection (identity
+%% pinning - actor keyIds are public, so without this a validly-signed token
+%% for another actor could hijack the session's identity refresh). Grants,
+%% limits and expiry are refreshed from the new validation; failures keep
+%% the connection alive under its current auth (heartbeat expiry enforcement
+%% remains the backstop).
+handle_message(#{<<"type">> := <<"reauth">>, <<"token">> := Token},
+               #state{authenticated = true, actor_token_id = ActorTokenId} = State) ->
+    case kraken_auth:validate_token(Token) of
+        {ok, AuthData} ->
+            NewActorTokenId = maps:get(actor_token_id, AuthData),
+            AuthExpiresAt = maps:get(auth_expires_at, AuthData, undefined),
+            case NewActorTokenId =:= ActorTokenId of
+                false ->
+                    kraken_log:info("[WS] reauth rejected: actor mismatch (~s -> ~s)~n",
+                        [ActorTokenId, NewActorTokenId]),
+                    Response = #{<<"type">> => <<"reauth">>, <<"success">> => false,
+                                 <<"error">> => <<"actor_mismatch">>},
+                    {reply, {binary, pack_msg(Response)}, State};
+                true ->
+                    case auth_expired(AuthExpiresAt) of
+                        true ->
+                            Response = #{<<"type">> => <<"reauth">>, <<"success">> => false,
+                                         <<"error">> => <<"token_expired">>},
+                            {reply, {binary, pack_msg(Response)}, State};
+                        false ->
+                            NewState0 = apply_refreshed_auth(AuthData, State),
+                            NewState = NewState0#state{auth_expires_at = AuthExpiresAt},
+                            kraken_log:info("[WS] reauth OK for actor ~s (expires ~p)~n",
+                                [ActorTokenId, AuthExpiresAt]),
+                            BaseResponse = #{<<"type">> => <<"reauth">>, <<"success">> => true},
+                            Response = case AuthExpiresAt of
+                                undefined -> BaseResponse;
+                                _ -> BaseResponse#{<<"authExpiresAt">> => AuthExpiresAt}
+                            end,
+                            {reply, {binary, pack_msg(Response)}, NewState}
+                    end
+            end;
+        {error, Reason} ->
+            kraken_log:info("[WS] reauth validate failed: ~s~n", [Reason]),
+            Response = #{<<"type">> => <<"reauth">>, <<"success">> => false,
+                         <<"error">> => Reason},
             {reply, {binary, pack_msg(Response)}, State}
     end;
 
@@ -1709,6 +1736,26 @@ async_revalidate(WsPid, ActorTokenId) ->
 auth_expired(undefined) -> false;
 auth_expired(ExpiresAt) when is_integer(ExpiresAt) ->
     erlang:system_time(second) >= ExpiresAt.
+
+%% Apply a fresh validation result to connection state: grants, limits,
+%% scope and the revalidation clock. Shared by periodic revalidation and
+%% in-band reauth. Does NOT touch auth_expires_at (the reauth clause owns
+%% that; revalidation is actorTokenId-based and must not clear a JWT expiry).
+apply_refreshed_auth(AuthData, State) ->
+    NewAllowedLobbies = maps:get(allowed_lobbies, AuthData, State#state.allowed_lobbies),
+    State#state{
+        allowed_topics = maps:get(allowed_topics, AuthData, State#state.allowed_topics),
+        allowed_lobbies = NewAllowedLobbies,
+        lobby_slug_map = build_lobby_slug_map(NewAllowedLobbies),
+        apps = maps:get(apps, AuthData, State#state.apps),
+        last_validation_at = erlang:timestamp(),
+        revalidation_in_progress = false,
+        max_connections = maps:get(max_connections, AuthData, State#state.max_connections),
+        max_message_size_bytes = maps:get(max_message_size_bytes, AuthData, State#state.max_message_size_bytes),
+        scope_id = maps:get(scope_id, AuthData, State#state.scope_id),
+        scope_slug = maps:get(scope_slug, AuthData, State#state.scope_slug),
+        scope_name = maps:get(scope_name, AuthData, State#state.scope_name)
+    }.
 
 %% Regular heartbeat work: echo the empty frame and trigger periodic
 %% token revalidation based on elapsed time (~10 min)
