@@ -70,7 +70,10 @@
     %% Access scope for tenant isolation (injected into topic patterns)
     scope_slug :: binary() | undefined,
     scope_id :: binary() | undefined,
-    scope_name :: binary() | undefined
+    scope_name :: binary() | undefined,
+    %% Client-token (JWT) expiry in unix seconds. The connection is closed
+    %% (4003) when this passes. undefined for opaque actor tokens.
+    auth_expires_at :: non_neg_integer() | undefined
 }).
 
 %%====================================================================
@@ -93,33 +96,22 @@ websocket_init(State) ->
     {ok, State#state{kraken_store = WriterPid}}.
 
 %% Handle empty binary (heartbeat) - respond with empty if authenticated
-%% Also triggers periodic token revalidation based on elapsed time (~10 min)
+%% Also enforces client-token (JWT) expiry and triggers periodic token
+%% revalidation based on elapsed time (~10 min)
 websocket_handle({binary, <<>>}, #state{authenticated = true} = State) ->
-    Now = erlang:timestamp(),
-
-    %% Check if revalidation is needed (>= 10 minutes since last validation)
-    NeedsRevalidation = case State#state.last_validation_at of
-        undefined -> true;
-        LastTime ->
-            ElapsedSeconds = timer:now_diff(Now, LastTime) div 1000000,
-            ElapsedSeconds >= ?REVALIDATION_INTERVAL_SEC
-    end,
-
-    State1 = case NeedsRevalidation andalso not State#state.revalidation_in_progress of
+    case auth_expired(State#state.auth_expires_at) of
         true ->
-            %% Time for revalidation - spawn async process
-            WsPid = self(),
-            ActorTokenId = State#state.actor_token_id,
-            spawn(fun() ->
-                async_revalidate(WsPid, ActorTokenId)
-            end),
-            %% Mark revalidation in progress
-            State#state{revalidation_in_progress = true};
+            kraken_log:info("[WS] Client token expired for actor ~s - closing (4003)~n",
+                [State#state.actor_token_id]),
+            DisconnectMsg = #{
+                <<"type">> => <<"disconnect">>,
+                <<"reason">> => <<"token_expired">>
+            },
+            {reply, [{binary, pack_msg(DisconnectMsg)},
+                     {close, 4003, <<"token_expired">>}], State};
         false ->
-            %% Not time yet or already in progress
-            State
-    end,
-    {reply, {binary, <<>>}, State1};
+            heartbeat_tick(State)
+    end;
 
 %% Ignore heartbeat if not authenticated
 websocket_handle({binary, <<>>}, State) ->
@@ -462,6 +454,21 @@ handle_message(#{<<"type">> := <<"auth">>, <<"token">> := Token} = Message, Stat
             %% Log first few allowed topics for debugging
             DebugTopics = lists:sublist(maps:get(allowed_topics, AuthData, []), 3),
             kraken_log:info("[WS][Auth] first allowed_topics: ~p", [DebugTopics]),
+            %% Connect-time expiry guard for client tokens (JWTs). The 30s
+            %% auth cache can serve AuthData for an already-expired token;
+            %% the embedded expiry makes it self-describing.
+            AuthExpiresAt = maps:get(auth_expires_at, AuthData, undefined),
+            case auth_expired(AuthExpiresAt) of
+            true ->
+                kraken_store:log_event(connection_rejected, #{
+                    reason => <<"token_expired">>,
+                    token_preview => token_preview(Token),
+                    project_id => ClientProjectId
+                }),
+                ExpiredResponse = #{<<"type">> => <<"auth">>, <<"success">> => false,
+                                    <<"error">> => <<"token_expired">>},
+                {reply, {binary, pack_msg(ExpiredResponse)}, State};
+            false ->
             %% Extract persistent session config for agent/orchestrator actors
             PersistentSession = maps:get(persistent_session, AuthData, false),
             SessionExpiry = maps:get(session_expiry_seconds, AuthData, 3600),
@@ -509,7 +516,8 @@ handle_message(#{<<"type">> := <<"auth">>, <<"token">> := Token} = Message, Stat
                 scope_slug = ScopeSlug,
                 scope_id = ScopeId,
                 scope_name = ScopeName,
-                protocol_version = NegotiatedVersion
+                protocol_version = NegotiatedVersion,
+                auth_expires_at = AuthExpiresAt
             },
 
             %% Log connection success to Firestore
@@ -568,6 +576,7 @@ handle_message(#{<<"type">> := <<"auth">>, <<"token">> := Token} = Message, Stat
                 BrokerResponse = #{<<"type">> => <<"auth">>, <<"success">> => false,
                                    <<"error">> => <<"broker_unavailable">>},
                 {reply, {binary, pack_msg(BrokerResponse)}, State}
+            end
             end;
 
         {error, Reason} ->
@@ -1694,6 +1703,41 @@ async_revalidate(WsPid, ActorTokenId) ->
         {retry, Reason} ->
             WsPid ! {revalidation_retry, Reason}
     end.
+
+%% True when a client-token (JWT) expiry has passed.
+%% undefined = opaque actor token, never expires at this layer.
+auth_expired(undefined) -> false;
+auth_expired(ExpiresAt) when is_integer(ExpiresAt) ->
+    erlang:system_time(second) >= ExpiresAt.
+
+%% Regular heartbeat work: echo the empty frame and trigger periodic
+%% token revalidation based on elapsed time (~10 min)
+heartbeat_tick(State) ->
+    Now = erlang:timestamp(),
+
+    %% Check if revalidation is needed (>= 10 minutes since last validation)
+    NeedsRevalidation = case State#state.last_validation_at of
+        undefined -> true;
+        LastTime ->
+            ElapsedSeconds = timer:now_diff(Now, LastTime) div 1000000,
+            ElapsedSeconds >= ?REVALIDATION_INTERVAL_SEC
+    end,
+
+    State1 = case NeedsRevalidation andalso not State#state.revalidation_in_progress of
+        true ->
+            %% Time for revalidation - spawn async process
+            WsPid = self(),
+            ActorTokenId = State#state.actor_token_id,
+            spawn(fun() ->
+                async_revalidate(WsPid, ActorTokenId)
+            end),
+            %% Mark revalidation in progress
+            State#state{revalidation_in_progress = true};
+        false ->
+            %% Not time yet or already in progress
+            State
+    end,
+    {reply, {binary, <<>>}, State1}.
 
 %% Extract room name from full topic pattern (app-name/room-slug/topic)
 %% Looks up roomName from allowed topics if available, otherwise parses the pattern

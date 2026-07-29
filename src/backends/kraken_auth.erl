@@ -5,7 +5,12 @@
 %%   #{actor_token_id, organization_id, project_id, project_name,
 %%     actor_type, apps, allowed_topics, active_subscriptions,
 %%     allowed_lobbies, max_connections, max_message_size_bytes,
-%%     persistent_session, session_expiry_seconds, scope_slug}
+%%     persistent_session, session_expiry_seconds, scope_slug,
+%%     auth_expires_at}
+%%
+%% auth_expires_at (unix seconds | undefined) is set for short-lived
+%% client tokens (customer-minted JWTs); the ws handler disconnects the
+%% connection when it passes. Absent/null for opaque actor tokens.
 %%
 %% Built-ins: kraken_auth_static (token file, the OSS quickstart) and
 %% kraken_auth_http (delegates to an external control plane over HTTP).
@@ -134,7 +139,8 @@ build_auth_data(Attrs) ->
         max_message_size_bytes => parse_max_message_size(maps:get(<<"max_message_size_bytes">>, Attrs, undefined)),
         persistent_session => maps:get(<<"persistent_session">>, Attrs, false),
         session_expiry_seconds => parse_session_expiry(maps:get(<<"session_expiry_seconds">>, Attrs, 0)),
-        scope_slug => ScopeSlug
+        scope_slug => ScopeSlug,
+        auth_expires_at => parse_auth_expires_at(maps:get(<<"auth_expires_at">>, Attrs, undefined))
     }.
 
 flatten_topics(Apps) ->
@@ -185,6 +191,9 @@ parse_session_expiry(null) -> 0;
 parse_session_expiry(undefined) -> 0;
 parse_session_expiry(N) when is_integer(N), N >= 0 -> N;
 parse_session_expiry(_) -> 0.
+
+parse_auth_expires_at(N) when is_integer(N), N > 0 -> N;
+parse_auth_expires_at(_) -> undefined.
 
 %% Find the app that owns a topic (by exact pattern membership)
 find_app_for_topic(_Pattern, []) ->
