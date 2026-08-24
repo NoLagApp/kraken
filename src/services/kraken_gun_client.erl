@@ -2,6 +2,12 @@
 %% @doc Gun HTTP Client
 %% Manages a persistent gun connection to a target host.
 %% Requests go directly from the caller's process (no serialization).
+%%
+%% The configured URL may carry a path, which is kept and prefixed onto
+%% every request path. Backends pass the endpoint alone
+%% (e.g. <<"/validate">>), so a control plane mounted under a prefix
+%% (http://host/v1/internal/actors) or behind a reverse proxy is reached
+%% correctly. A URL with no path leaves request paths untouched.
 %% @end
 %%%-------------------------------------------------------------------
 -module(kraken_gun_client).
@@ -9,6 +15,8 @@
 
 -export([start_link/2, start_link/3, request/5, request/6]).
 -export([init/1, handle_info/2, handle_cast/2, handle_call/3, terminate/2]).
+%% Exported for tests
+-export([normalise_base_path/1]).
 
 -define(ETS_TABLE, kraken_gun_client_conns).
 -define(DEFAULT_TIMEOUT, 5000).
@@ -30,12 +38,23 @@ request(Name, Method, Path, Headers, Body) ->
     request(Name, Method, Path, Headers, Body, ?DEFAULT_TIMEOUT).
 
 request(Name, Method, Path, Headers, Body, Timeout) ->
+    FullPath = with_base_path(Name, Path),
     LookupName = pick_connection(Name),
     case ets:lookup(?ETS_TABLE, LookupName) of
         [{LookupName, ConnPid}] ->
-            do_request(LookupName, ConnPid, Method, Path, Headers, Body, Timeout);
+            do_request(LookupName, ConnPid, Method, FullPath, Headers, Body, Timeout);
         [] ->
             {error, no_connection}
+    end.
+
+%% Prefix the configured URL's path onto a backend's endpoint path. Falls
+%% back to the bare path when nothing is registered, which keeps the
+%% behaviour of a URL that carries no path.
+with_base_path(Name, Path) ->
+    case ets:lookup(?ETS_TABLE, {base_path, Name}) of
+        [{_, <<>>}] -> Path;
+        [{_, Base}] -> <<Base/binary, Path/binary>>;
+        [] -> Path
     end.
 
 %% Round-robin across pool members, or use single connection
@@ -74,6 +93,16 @@ init([Name, Url]) ->
     #{host := Host} = Parsed = uri_string:parse(UrlBin),
     Scheme = maps:get(scheme, Parsed, <<"https">>),
     Port = maps:get(port, Parsed, default_port(Scheme)),
+    %% Registered under the base name so every member of a pool shares it,
+    %% and so request/6 (which runs in the caller's process) can read it
+    %% without going through this gen_server.
+    PoolBaseName = case Name of
+        {NameOfPool, _} -> NameOfPool;
+        _ -> Name
+    end,
+    ets:insert(?ETS_TABLE,
+               {{base_path, PoolBaseName},
+                normalise_base_path(maps:get(path, Parsed, <<>>))}),
     State = #{
         name => Name,
         host => binary_to_list(Host),
@@ -222,3 +251,23 @@ kraken_gun_client_name(Name) ->
 default_port(<<"https">>) -> 443;
 default_port(<<"http">>) -> 80;
 default_port(_) -> 443.
+
+%% Reduce a URL path to a prefix that concatenates cleanly with a backend's
+%% leading-slash endpoint path. "/v1/internal/actors/" and "/v1/internal/actors"
+%% both become <<"/v1/internal/actors">>; "" and "/" both become <<>>, which
+%% leaves request paths untouched.
+normalise_base_path(Path) when is_list(Path) ->
+    normalise_base_path(list_to_binary(Path));
+normalise_base_path(<<>>) ->
+    <<>>;
+normalise_base_path(<<"/">>) ->
+    <<>>;
+normalise_base_path(Path) when is_binary(Path) ->
+    Trimmed = string:trim(Path, trailing, "/"),
+    case Trimmed of
+        <<>> -> <<>>;
+        <<"/", _/binary>> -> Trimmed;
+        _ -> <<"/", Trimmed/binary>>
+    end;
+normalise_base_path(_) ->
+    <<>>.
