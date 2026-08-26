@@ -2216,7 +2216,11 @@ unknown_topic_frame(PV) when PV >= 2 ->
         <<"type">> => <<"error">>,
         <<"code">> => 42940,
         <<"error">> => <<"unknown_topic">>,
-        <<"hint">> => <<"room is not configured — provision it via the control-plane rooms API before use">>
+        %% ASCII only. A <<"...">> literal takes the low 8 bits of each
+        %% codepoint, so any character above U+00FF is silently truncated to
+        %% one byte of garbage. This hint carried an em dash (U+2014) and
+        %% shipped a raw \x14 to every client that hit a denied subscribe.
+        <<"hint">> => <<"room is not configured. Provision it via the control-plane rooms API before use.">>
     };
 unknown_topic_frame(_PV) ->
     #{<<"type">> => <<"error">>, <<"error">> => <<"not_authorized">>}.
