@@ -11,6 +11,7 @@
 -module(kraken_broker_mqtt).
 -behaviour(kraken_broker).
 
+-export([session_options/4]).
 -export([
     start/0,
     capabilities/0,
@@ -77,6 +78,41 @@ connect() ->
 connect(AuthData) ->
     connect(AuthData, false, 0).
 
+%% How this connection identifies its MQTT session.
+%%
+%% Persistent sessions use a stable ClientId so the broker can resume across
+%% reconnects. The key is the session key rather than the actor id, because a
+%% session belongs to a client instance and not to a credential — see
+%% kraken_session. Non-persistent sessions take a unique suffix, which is what
+%% lets many concurrent connections share one token.
+%%
+%% The expiry has to travel as an MQTT 5 CONNECT property. emqtt speaks 3.1.1
+%% by default and silently drops options it does not recognise, so the
+%% `session_expiry_interval' passed here previously never reached the broker at
+%% all: sessions were kept under 3.1.1 rules, which is to say for ever. Only
+%% persistent connections switch to v5; a clean session has no expiry to
+%% express and no reason to change protocol.
+%%
+%% An expiry of zero or less means the control plane did not configure one.
+%% That is sent as the "never expire" value rather than as a literal 0, which
+%% in v5 would end the session at disconnect and silently throw away the queue
+%% this whole mechanism exists to keep.
+-define(SESSION_NEVER_EXPIRES, 16#FFFFFFFF).
+
+-spec session_options(boolean(), binary(), binary(), integer()) ->
+    {binary(), boolean(), map()}.
+session_options(true, _ActorTokenId, SessionKey, SessionExpirySeconds) ->
+    Expiry = case SessionExpirySeconds of
+        N when is_integer(N), N > 0 -> N;
+        _ -> ?SESSION_NEVER_EXPIRES
+    end,
+    {<<"kraken_agent_", SessionKey/binary>>, false,
+     #{proto_ver => v5,
+       properties => #{'Session-Expiry-Interval' => Expiry}}};
+session_options(false, ActorTokenId, _SessionKey, _SessionExpirySeconds) ->
+    UniqueId = integer_to_binary(erlang:unique_integer([positive])),
+    {<<"kraken_proxy_", ActorTokenId/binary, "_", UniqueId/binary>>, true, #{}}.
+
 %% Connect to EMQX with actor credentials and persistent session config
 %% PersistentSession: true for agents/orchestrators, false for others
 %% SessionExpirySeconds: MQTT 5.0 session expiry (only used when PersistentSession = true)
@@ -86,23 +122,9 @@ connect(AuthData, PersistentSession, SessionExpirySeconds) ->
 
     ActorTokenId = maps:get(actor_token_id, AuthData),
 
-    %% Persistent sessions use a stable ClientId (no unique suffix) so EMQX
-    %% can resume the session across reconnects. Non-persistent sessions use
-    %% a unique suffix to allow multiple concurrent connections.
-    {ClientId, CleanStart, ExpiryProps} = case PersistentSession of
-        true ->
-            %% An MQTT session belongs to a client instance. Without a session
-            %% key every process holding this token asks for the same session,
-            %% and the second one is a takeover that disconnects the first —
-            %% see kraken_session.
-            SessionKey = maps:get(session_key, AuthData, ActorTokenId),
-            StableId = <<"kraken_agent_", SessionKey/binary>>,
-            {StableId, false, #{session_expiry_interval => SessionExpirySeconds}};
-        false ->
-            UniqueId = integer_to_binary(erlang:unique_integer([positive])),
-            UniqueClientId = <<"kraken_proxy_", ActorTokenId/binary, "_", UniqueId/binary>>,
-            {UniqueClientId, true, #{}}
-    end,
+    SessionKey = maps:get(session_key, AuthData, ActorTokenId),
+    {ClientId, CleanStart, ExpiryProps} =
+        session_options(PersistentSession, ActorTokenId, SessionKey, SessionExpirySeconds),
 
     %% Get the calling process (WebSocket handler) to forward messages to it
     WsPid = self(),
