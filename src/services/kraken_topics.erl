@@ -29,6 +29,7 @@
 
 -export([resolve/2, fallback_topic/2, legacy_fallback_topic/2]).
 -export([find_rule/2]).
+-export([display_for/2]).
 
 %%====================================================================
 %% Resolution
@@ -106,3 +107,56 @@ rule_app_id(Rule) ->
         AppId when is_binary(AppId), AppId =/= <<>> -> AppId;
         _ -> <<"unscoped">>
     end.
+
+%%====================================================================
+%% Reverse resolution
+%%====================================================================
+
+%% Internal (room-uuid) topic back to the display topic the SDK keys its
+%% handlers on.
+%%
+%% The connection normally learns this from the mapping it records when it
+%% subscribes, but a resumed MQTT session flushes its queued messages
+%% immediately after CONNACK — before any subscribe has been made on the new
+%% connection, so that mapping does not exist yet. Those frames would then be
+%% forwarded under the internal topic, and the SDK, which has no handler by
+%% that name, drops them silently: exactly the messages the persistent session
+%% existed to keep. `allowed_topics` carries the same pairing and is available
+%% from the moment the connection authenticates.
+-spec display_for(binary(), list()) -> binary() | undefined.
+display_for(MqttTopic, AllowedTopics) when is_binary(MqttTopic), is_list(AllowedTopics) ->
+    case exact_display(MqttTopic, AllowedTopics) of
+        undefined ->
+            %% A filtered publish arrives as <internal>/<filter>; the rule
+            %% names only the base.
+            case binary:split(MqttTopic, <<"/">>, [global]) of
+                Parts when length(Parts) >= 2 ->
+                    Parent = join_parts(lists:droplast(Parts)),
+                    exact_display(Parent, AllowedTopics);
+                _ ->
+                    undefined
+            end;
+        Display ->
+            Display
+    end;
+display_for(_MqttTopic, _AllowedTopics) ->
+    undefined.
+
+exact_display(MqttTopic, AllowedTopics) ->
+    case lists:search(
+            fun(Rule) when is_map(Rule) ->
+                    maps:get(<<"topic">>, Rule, undefined) =:= MqttTopic;
+               (_) -> false
+            end, AllowedTopics) of
+        {value, Rule} ->
+            case maps:get(<<"pattern">>, Rule, undefined) of
+                P when is_binary(P) -> P;
+                _ -> undefined
+            end;
+        false ->
+            undefined
+    end.
+
+join_parts([]) -> <<>>;
+join_parts([H | T]) ->
+    lists:foldl(fun(P, Acc) -> <<Acc/binary, "/", P/binary>> end, H, T).

@@ -173,13 +173,24 @@ websocket_info({store_topic_mapping, MqttTopic, DisplayTopic}, State) ->
 %% Handle MQTT publish from emqtt msg_handler
 websocket_info({mqtt_publish, #{topic := MqttTopic, payload := Payload}},
                #state{connection_id = ConnectionId, actor_token_id = ActorTokenId,
+                      allowed_topics = AllowedForDisplay,
                       kraken_store = FirestoreWriter} = State) ->
     %% Look up the display topic — try exact match first, then parent topic lookup
     DisplayTopic = case get({topic_mapping, MqttTopic}) of
         undefined ->
             %% Try stripping last segment (filter value) to find parent topic mapping
             case find_display_topic_by_prefix(MqttTopic) of
-                undefined -> MqttTopic;
+                undefined ->
+                    %% No subscribe has recorded a mapping on this connection
+                    %% yet. A resumed session flushes its queued messages right
+                    %% after CONNACK, before any subscribe happens, so fall back
+                    %% to the pairing in allowed_topics instead of forwarding
+                    %% the internal topic — the SDK has no handler by that name
+                    %% and drops exactly the messages the session was holding.
+                    case kraken_topics:display_for(MqttTopic, AllowedForDisplay) of
+                        undefined -> MqttTopic;
+                        Resolved -> Resolved
+                    end;
                 DT -> DT
             end;
         DT ->

@@ -74,3 +74,37 @@ resolve_exact_without_internal_topic_degrades_to_wildcard_test() ->
 legacy_fallback_test() ->
     %% The pre-fix name, kept only for the one-release dual-subscribe shim
     ?assertEqual(<<"unknown/app/room/x">>, kraken_topics:legacy_fallback_topic(undefined, <<"app/room/x">>)).
+
+%%====================================================================
+%% Reverse resolution (internal topic -> display topic)
+%%====================================================================
+%% A resumed MQTT session flushes its queue before any subscribe has recorded
+%% a topic mapping on the new connection, so the display topic has to be
+%% recoverable from allowed_topics alone. Without it those frames go out under
+%% the internal room-uuid topic and the SDK drops them — the exact messages the
+%% persistent session was holding.
+
+display_rules() ->
+    [#{<<"pattern">> => <<"dev/echo-room/tasks">>,
+       <<"topic">> => <<"echo-room-uuid/tasks">>},
+     #{<<"pattern">> => <<"dev/echo-room/state">>,
+       <<"topic">> => <<"echo-room-uuid/state">>},
+     not_a_map].
+
+display_for_exact_test() ->
+    ?assertEqual(<<"dev/echo-room/tasks">>,
+                 kraken_topics:display_for(<<"echo-room-uuid/tasks">>, display_rules())),
+    ?assertEqual(<<"dev/echo-room/state">>,
+                 kraken_topics:display_for(<<"echo-room-uuid/state">>, display_rules())).
+
+%% A filtered publish arrives as <internal>/<filter>; the rule names the base.
+display_for_filtered_publish_test() ->
+    ?assertEqual(<<"dev/echo-room/tasks">>,
+                 kraken_topics:display_for(<<"echo-room-uuid/tasks/agent-7">>, display_rules())).
+
+display_for_unknown_is_undefined_test() ->
+    ?assertEqual(undefined,
+                 kraken_topics:display_for(<<"other-room-uuid/tasks">>, display_rules())),
+    ?assertEqual(undefined, kraken_topics:display_for(<<"nozslash">>, display_rules())),
+    ?assertEqual(undefined, kraken_topics:display_for(<<"echo-room-uuid/tasks">>, [])),
+    ?assertEqual(undefined, kraken_topics:display_for(not_a_binary, display_rules())).

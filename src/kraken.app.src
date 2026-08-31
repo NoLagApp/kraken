@@ -1,6 +1,6 @@
 {application, kraken, [
     {description, "Kraken - pluggable realtime pub/sub proxy (auth, broker, store and control-plane backends)"},
-    {vsn, "0.8.0"},  %% an MQTT session belongs to a client instance, not a credential: a second connection for one actor no longer takes over its session
+    {vsn, "0.8.1"},  %% queued messages from a resumed session are labelled with the display topic, not the internal one, so the SDK stops dropping them
     {registered, []},
     {mod, {kraken_app, []}},
     {applications, [
