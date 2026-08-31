@@ -24,6 +24,9 @@
 %%%-------------------------------------------------------------------
 -module(kraken_replay).
 
+%% Pages of `limit` messages a single replay will walk before stopping.
+-define(MAX_PAGES, 10).
+
 -export([start_replay/4]).
 
 %% Context map: #{group_id, room_id, limit?}
@@ -66,24 +69,12 @@ do_replay(ActorId, AppId, Ctx, WsPid, Parent) ->
     end.
 
 do_replay(ActorId, AppId, GroupId, RoomId, DisplayTopic, Cursor, Limit, WsPid, Parent) ->
-    case kraken_delivery_store:pending(#{
-            app_id => AppId, room_id => RoomId, group_id => GroupId,
-            cursor => Cursor, limit => Limit}) of
+    case fetch_page(AppId, RoomId, GroupId, Cursor, Limit) of
         {ok, Candidates} ->
             Parent ! {update_replay_status, ActorId, replaying},
-            %% Claim each (exactly-one per group). Keep winners in order;
-            %% advance the cursor past every candidate we examined (won or
-            %% lost — a lost one was handled by another member).
-            {WonRev, ReplayedIds, MaxTs} = lists:foldl(
-                fun(Entry, {AccMsgs, AccIds, AccTs}) ->
-                    MsgId = maps:get(message_id, Entry, undefined),
-                    Ts = maps:get(timestamp, Entry, 0),
-                    NewTs = max(Ts, AccTs),
-                    case claim(AppId, GroupId, MsgId, ActorId) of
-                        won  -> {[Entry | AccMsgs], add_id(MsgId, AccIds), NewTs};
-                        lost -> {AccMsgs, AccIds, NewTs}
-                    end
-                end, {[], [], Cursor}, Candidates),
+            {WonRev, ReplayedIds, MaxTs} = drain(
+                ActorId, AppId, GroupId, RoomId, Limit, ?MAX_PAGES,
+                Candidates, {[], [], Cursor}),
             Won = lists:reverse(WonRev),
             Parent ! {update_replayed_ids, ActorId, ReplayedIds},
             send(WsPid, #{<<"type">> => <<"replayStart">>, <<"count">> => length(Won)}),
@@ -97,6 +88,56 @@ do_replay(ActorId, AppId, GroupId, RoomId, DisplayTopic, Cursor, Limit, WsPid, P
             send(WsPid, #{<<"type">> => <<"replayEnd">>, <<"replayed">> => 0}),
             Parent ! {replay_complete, ActorId, []}
     end.
+
+fetch_page(AppId, RoomId, GroupId, Cursor, Limit) ->
+    kraken_delivery_store:pending(#{
+        app_id => AppId, room_id => RoomId, group_id => GroupId,
+        cursor => Cursor, limit => Limit}).
+
+%% Claim a page (exactly-one per group), keeping winners in order and
+%% advancing past every candidate examined — won or lost, since a lost one was
+%% handled by another member.
+%%
+%% Pages, rather than one query, because a full page is not evidence that the
+%% backlog ends there. Live deliveries are claimed as they happen, so a busy
+%% group can return a whole page of already-taken messages that yields nothing
+%% to send; stopping there would strand the genuinely missed work behind it
+%% until some later reconnect, and {replay_started, GroupId} means this
+%% connection will not try again. Bounded by ?MAX_PAGES so a huge backlog
+%% cannot hold the replay process indefinitely.
+drain(ActorId, AppId, GroupId, _RoomId, _Limit, 0, Candidates, Acc) ->
+    claim_page(ActorId, AppId, GroupId, Candidates, Acc);
+drain(ActorId, AppId, GroupId, RoomId, Limit, PagesLeft, Candidates, Acc) ->
+    {_, _, MaxTs} = Next = claim_page(ActorId, AppId, GroupId, Candidates, Acc),
+    case length(Candidates) =:= Limit andalso Limit > 0 of
+        true ->
+            case fetch_page(AppId, RoomId, GroupId, MaxTs, Limit) of
+                {ok, []} -> Next;
+                {ok, More} ->
+                    drain(ActorId, AppId, GroupId, RoomId, Limit,
+                          PagesLeft - 1, More, Next);
+                {error, Reason} ->
+                    %% Keep what this run already claimed; the cursor advances
+                    %% to MaxTs, so the remainder is still pending next time.
+                    kraken_log:error("[Replay] pending page failed for group ~s: ~p",
+                                     [GroupId, Reason]),
+                    Next
+            end;
+        false ->
+            Next
+    end.
+
+claim_page(ActorId, AppId, GroupId, Candidates, Acc) ->
+    lists:foldl(
+        fun(Entry, {AccMsgs, AccIds, AccTs}) ->
+            MsgId = maps:get(message_id, Entry, undefined),
+            Ts = maps:get(timestamp, Entry, 0),
+            NewTs = max(Ts, AccTs),
+            case claim(AppId, GroupId, MsgId, ActorId) of
+                won  -> {[Entry | AccMsgs], add_id(MsgId, AccIds), NewTs};
+                lost -> {AccMsgs, AccIds, NewTs}
+            end
+        end, Acc, Candidates).
 
 %% Claim a message for this group member. On backend error, fall back to
 %% delivering (at-least-once) — duplicates are caught by consumer-side

@@ -38,6 +38,19 @@
         %% miss, as before). Literal (not a ${VAR}) so deployments that don't set
         %% it can't render an invalid config.
         {cache_miss_fallback_enabled, true},
+
+        %% Release load-balanced ($share) subscriptions when a connection
+        %% closes. A persistent MQTT session keeps its subscriptions across the
+        %% disconnect, so without this the broker keeps giving a departed
+        %% member its turn in the group's round robin, and a resumed session
+        %% accumulates a subscription for every group name the actor has used.
+        %% Only applies to persistent sessions, and only when the delivery
+        %% store is enabled — durable replay is what then holds a
+        %% scaled-to-zero group's backlog, and without it the retained
+        %% subscription is the only thing that does. On by default; set false
+        %% to disable (kill-switch). Literal (not a ${VAR}) so deployments that
+        %% don't set it can't render an invalid config.
+        {release_shared_subs_on_close, true},
         {cache_miss_fallback_timeout_ms, 2000}, %% per-check HTTP timeout (blocks the actor's conn)
         {acl_deny_cache_ttl_ms, 5000},           %% negative-cache window for a denied {actor, pattern}
 

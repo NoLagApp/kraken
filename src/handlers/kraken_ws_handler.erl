@@ -200,10 +200,12 @@ websocket_info({mqtt_publish, #{topic := MqttTopic, payload := Payload}},
                 #{<<"_sender">> := Sender, <<"data">> := InnerData} ->
                     %% Message has sender info but it's from another connection, forward it
                     maybe_log_delivery(FirestoreWriter, MsgId, ActorTokenId, DisplayTopic),
+                    kraken_lb:claim_live(MsgId, DisplayTopic, ActorTokenId),
                     forward_message_with_filter(DisplayTopic, InnerData, MsgId, FilterValue, State);
                 _ ->
                     %% Regular message without sender info (echo=true), forward as-is
                     maybe_log_delivery(FirestoreWriter, MsgId, ActorTokenId, DisplayTopic),
+                    kraken_lb:claim_live(MsgId, DisplayTopic, ActorTokenId),
                     forward_message_with_filter(DisplayTopic, ActualPayload, MsgId, FilterValue, State)
             end;
         {error, DecodeError} ->
@@ -345,6 +347,7 @@ terminate(Reason, _Req, #state{mqtt_client = MqttClient, current_room_id = RoomI
                                 authenticated = Authenticated,
                                 subscribed_lobbies = SubscribedLobbies,
                                 persistent_presence = PersistentPresence,
+                                persistent_session = PersistentSession,
                                 allowed_topics = AllowedTopics,
                                 kraken_store = FirestoreWriter} = _State) ->
     kraken_log:info("[WS] Connection closed~n", []),
@@ -379,7 +382,12 @@ terminate(Reason, _Req, #state{mqtt_client = MqttClient, current_room_id = RoomI
     %% load-balanced durable subscription, so a reconnecting group member
     %% replays ONLY messages dispatched while offline — not the window it
     %% already consumed live.
-    dd_mark_offline_boundary(),
+    kraken_lb:mark_offline_boundary(),
+    %% Give back this connection's share of every load-balanced group BEFORE
+    %% the session is retained. A persistent session keeps its subscriptions
+    %% across the disconnect, so without this the broker keeps round-robining
+    %% work to a member that is no longer here.
+    kraken_lb:release_shared_subscriptions(MqttClient, PersistentSession),
     %% Leave all subscribed lobbies (each entry is {Slug, [UUID]})
     lists:foreach(fun({_Slug, UUIDs}) ->
         lists:foreach(fun(UUID) ->
@@ -807,7 +815,7 @@ handle_message(#{<<"type">> := <<"subscribe">>, <<"topic">> := Pattern} = Messag
                     %% can't replay at subscribe-only because the SDK advertises
                     %% persistence AFTER subscribing.
                     case LoadBalance of
-                        true -> remember_lb_subscription(Pattern, ResRoomId, AppId, LoadBalanceGroup);
+                        true -> kraken_lb:remember_subscription(Pattern, ResRoomId, AppId, LoadBalanceGroup);
                         false -> ok
                     end,
                     NewState2 = case NewState#state.persistent_session of
@@ -868,6 +876,9 @@ handle_message(#{<<"type">> := <<"unsubscribe">>, <<"topic">> := Pattern},
             erase({mqtt_topic_for, Pattern})
     end,
     erase({base_topic_for, Pattern}),
+    %% Drop the load-balanced replay context; keeping it would arm a replay
+    %% for a group this connection has left.
+    kraken_lb:forget_subscription(Pattern),
     %% Clean up filter state
     NewTopicFilters = maps:remove(Pattern, State#state.topic_filters),
     %% Persist unsubscription to Titus (async) - use pattern for tracking
@@ -1500,6 +1511,20 @@ restore_subscriptions(MqttClient, [Subscription | Rest], State, WsPid) ->
                 ok = kraken_broker:subscribe(MqttClient, MT, Pattern, WsPid)
             end, MqttTopics),
             put({mqtt_topics_for, Pattern}, MqttTopics),
+            %% Same replay context the live subscribe path records. Without it a
+            %% server-restored connection has no {lb_subscription, _} entry at
+            %% all, so it never arms replay, never stamps an offline boundary,
+            %% and its live deliveries cannot be claimed.
+            case LoadBalance of
+                true ->
+                    RestoredRoomId = case kraken_topics:resolve(Pattern, AllowedTopics) of
+                        {exact, _, RId, _} -> RId;
+                        _ -> undefined
+                    end,
+                    kraken_lb:remember_subscription(Pattern, RestoredRoomId, AppId, LoadBalanceGroup);
+                false ->
+                    ok
+            end,
             %% Store filter state in WsPid process (restore_subscriptions runs in WsPid context)
             case Filters of
                 [] -> ok;
@@ -1583,40 +1608,6 @@ maybe_log_delivery(_FirestoreWriter, undefined, _ActorTokenId, _Topic) ->
 maybe_log_delivery(FirestoreWriter, MsgId, ActorTokenId, Topic) ->
     Timestamp = erlang:system_time(millisecond),
     kraken_store:log_delivery(FirestoreWriter, MsgId, ActorTokenId, Topic, Timestamp).
-
-%% On disconnect, stamp each load-balanced durable subscription's group cursor
-%% at "now" — the offline boundary. A reconnecting group member then replays
-%% only messages dispatched after this point (what it missed while offline),
-%% instead of re-surfacing the window it already consumed live. For a
-%% scale-to-zero pool (one instance cycling) this disconnect is the group going
-%% offline; multi-instance pools rely on the per-message claim + consumer
-%% idempotency to dedup any overlap. Inert unless the delivery_store is enabled.
-dd_mark_offline_boundary() ->
-    case catch kraken_delivery_store:is_enabled() of
-        true ->
-            Now = erlang:system_time(millisecond),
-            lists:foreach(
-                fun({{lb_subscription, _Pattern}, Ctx}) when is_map(Ctx) ->
-                        catch kraken_delivery_store:cursor_set(
-                            #{app_id => maps:get(app_id, Ctx, <<>>),
-                              group_id => maps:get(group_id, Ctx, <<>>)}, Now);
-                   (_) -> ok
-                end, get());
-        _ ->
-            ok
-    end.
-
-%% Remember a load-balanced subscription's replay context (group/room/app),
-%% keyed by pattern, so a later persistent signal can replay it. Needs a
-%% resolved room to scope the backlog query.
-remember_lb_subscription(Pattern, RoomId, AppId, GroupId) when RoomId =/= undefined ->
-    %% topic = the subscribed Pattern (the DISPLAY topic the SDK keys its handler
-    %% on); replayed frames must carry it, not the message's internal topic.
-    put({lb_subscription, Pattern},
-        #{group_id => GroupId, room_id => RoomId, app_id => AppId, topic => Pattern}),
-    ok;
-remember_lb_subscription(_Pattern, _RoomId, _AppId, _GroupId) ->
-    ok.
 
 %% Start a claim-based durable replay for every load-balanced subscription on
 %% this connection that hasn't replayed yet — a scale-to-zero worker draining

@@ -1,6 +1,6 @@
 {application, kraken, [
     {description, "Kraken - pluggable realtime pub/sub proxy (auth, broker, store and control-plane backends)"},
-    {vsn, "0.6.1"},
+    {vsn, "0.7.0"},  %% load-balanced groups: release $share subs on close; claim live deliveries so replay skips consumed work
     {registered, []},
     {mod, {kraken_app, []}},
     {applications, [
