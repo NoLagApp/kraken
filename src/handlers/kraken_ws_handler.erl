@@ -365,11 +365,14 @@ terminate(Reason, _Req, #state{mqtt_client = MqttClient, current_room_id = RoomI
             ok
     end,
 
-    %% Leave connection tracking group
+    %% Leave connection tracking groups
     case OrganizationId of
         undefined -> ok;
         _ -> syn:leave(kraken_connections, {org, OrganizationId}, self())
     end,
+    %% Stop counting against this actor, so the next connection can own its
+    %% session again once this one is gone.
+    kraken_session:release(ActorTokenId),
     %% Leave room presence group if set
     case RoomId of
         undefined -> ok;
@@ -458,10 +461,24 @@ handle_message(#{<<"type">> := <<"auth">>, <<"token">> := Token} = Message, Stat
                 {reply, {binary, pack_msg(ExpiredResponse)}, State};
             false ->
             %% Extract persistent session config for agent/orchestrator actors
-            PersistentSession = maps:get(persistent_session, AuthData, false),
+            WantsPersistent = maps:get(persistent_session, AuthData, false),
             SessionExpiry = maps:get(session_expiry_seconds, AuthData, 3600),
+            %% Which MQTT session this connection owns. A session belongs to a
+            %% client instance, not to a credential: keyed on the actor alone,
+            %% a second process holding the same token is a session takeover
+            %% that disconnects the first. An optional clientId names the
+            %% instance; without one, only the first live connection for the
+            %% actor keeps a resumable session.
+            ActorTokenIdForSession = maps:get(actor_token_id, AuthData),
+            {PersistentSession, SessionKey} = kraken_session:claim(
+                ActorTokenIdForSession, WantsPersistent,
+                maps:get(<<"clientId">>, Message, undefined)),
+            AuthDataSession = case SessionKey of
+                undefined -> AuthData;
+                _ -> AuthData#{session_key => SessionKey}
+            end,
             %% Connect to EMQX (returns unique ConnectionId for no-echo filtering)
-            case kraken_broker:connect(AuthData, PersistentSession, SessionExpiry) of
+            case kraken_broker:connect(AuthDataSession, PersistentSession, SessionExpiry) of
             {ok, MqttClient, ConnectionId} ->
 
             AllowedTopics = maps:get(allowed_topics, AuthData, []),

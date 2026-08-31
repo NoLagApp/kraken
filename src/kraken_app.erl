@@ -8,10 +8,12 @@
 -export([start/2, stop/1]).
 
 start(_StartType, _StartArgs) ->
-    %% SYN scopes: presence, lobbies, per-org connection tracking, and
-    %% topic groups for the built-in syn broker backend.
+    %% SYN scopes: presence, lobbies, per-org connection tracking, per-actor
+    %% connection tracking (so a second connection for one actor does not take
+    %% over its MQTT session), and topic groups for the syn broker backend.
     syn:start(),
-    syn:add_node_to_scopes([kraken_presence, kraken_lobbies, kraken_connections, kraken_topics]),
+    syn:add_node_to_scopes([kraken_presence, kraken_lobbies, kraken_connections,
+                            kraken_actors, kraken_topics]),
 
     %% httpc connection pooling (used by misc outbound HTTP)
     httpc:set_options([

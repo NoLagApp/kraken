@@ -91,7 +91,12 @@ connect(AuthData, PersistentSession, SessionExpirySeconds) ->
     %% a unique suffix to allow multiple concurrent connections.
     {ClientId, CleanStart, ExpiryProps} = case PersistentSession of
         true ->
-            StableId = <<"kraken_agent_", ActorTokenId/binary>>,
+            %% An MQTT session belongs to a client instance. Without a session
+            %% key every process holding this token asks for the same session,
+            %% and the second one is a takeover that disconnects the first —
+            %% see kraken_session.
+            SessionKey = maps:get(session_key, AuthData, ActorTokenId),
+            StableId = <<"kraken_agent_", SessionKey/binary>>,
             {StableId, false, #{session_expiry_interval => SessionExpirySeconds}};
         false ->
             UniqueId = integer_to_binary(erlang:unique_integer([positive])),

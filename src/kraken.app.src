@@ -1,6 +1,6 @@
 {application, kraken, [
     {description, "Kraken - pluggable realtime pub/sub proxy (auth, broker, store and control-plane backends)"},
-    {vsn, "0.7.0"},  %% load-balanced groups: release $share subs on close; claim live deliveries so replay skips consumed work
+    {vsn, "0.8.0"},  %% an MQTT session belongs to a client instance, not a credential: a second connection for one actor no longer takes over its session
     {registered, []},
     {mod, {kraken_app, []}},
     {applications, [
