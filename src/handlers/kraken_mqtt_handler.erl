@@ -63,8 +63,16 @@
     %% Rate limiting
     rate_limit = ?DEFAULT_RATE_LIMIT :: non_neg_integer(),
     msg_count = 0 :: non_neg_integer(),
-    rate_limit_second = 0 :: non_neg_integer()
+    rate_limit_second = 0 :: non_neg_integer(),
+    %% Same session rules as the WebSocket path: client-token (JWT) expiry,
+    %% periodic revalidation (a revoked token is disconnected) and the
+    %% per-organization connection limit
+    max_connections = unlimited :: non_neg_integer() | unlimited,
+    revalidation_in_progress = false :: boolean()
 }).
+
+%% Revalidate the token this often, like kraken_ws_handler
+-define(REVALIDATION_INTERVAL_MS, 600000).
 
 %%====================================================================
 %% Ranch Protocol Callbacks
@@ -164,6 +172,54 @@ handle_info({mqtt_publish, #{topic := Topic, payload := Packed} = Msg},
             end
     end;
 
+%% A client token (JWT) reached its expiry: MQTT 3.1.1 has no disconnect
+%% reason, so the connection is closed (the WebSocket path closes with 4003)
+handle_info(token_expired, #state{actor_token_id = ActorTokenId} = State) ->
+    kraken_log:info("[MQTT] Client token expired for actor ~s, closing~n", [ActorTokenId]),
+    {stop, normal, State};
+
+%% Periodic revalidation, as on the WebSocket path: a revoked token is
+%% disconnected, a changed grant set applies to new subscribes and publishes
+handle_info(revalidate, #state{actor_token_id = ActorTokenId,
+                               revalidation_in_progress = false} = State) ->
+    Self = self(),
+    spawn(fun() ->
+        Self ! case kraken_auth:revalidate_token(ActorTokenId) of
+            {ok, AuthData} -> {revalidation_success, AuthData};
+            {error, Reason} -> {revalidation_failed, Reason};
+            {retry, Reason} -> {revalidation_retry, Reason}
+        end
+    end),
+    {noreply, State#state{revalidation_in_progress = true}};
+handle_info(revalidate, State) ->
+    {noreply, State};
+
+handle_info({revalidation_success, AuthData}, #state{organization_id = OrgId} = State) ->
+    erlang:send_after(?REVALIDATION_INTERVAL_MS, self(), revalidate),
+    MaxConn = maps:get(max_connections, AuthData, State#state.max_connections),
+    State1 = State#state{
+        allowed_topics = maps:get(allowed_topics, AuthData, State#state.allowed_topics),
+        apps = maps:get(apps, AuthData, State#state.apps),
+        max_connections = MaxConn,
+        revalidation_in_progress = false
+    },
+    %% The limit may have been lowered; this connection is already counted
+    case over_connection_limit(OrgId, MaxConn, 1) of
+        false ->
+            {noreply, State1};
+        true ->
+            kraken_log:info("[MQTT] Org ~s over its connection limit after revalidation, closing~n", [OrgId]),
+            {stop, normal, State1}
+    end;
+
+handle_info({revalidation_failed, Reason}, #state{actor_token_id = ActorTokenId} = State) ->
+    kraken_log:info("[MQTT] Revalidation failed for ~s: ~p, closing~n", [ActorTokenId, Reason]),
+    {stop, normal, State};
+
+handle_info({revalidation_retry, _Reason}, State) ->
+    erlang:send_after(?REVALIDATION_INTERVAL_MS, self(), revalidate),
+    {noreply, State#state{revalidation_in_progress = false}};
+
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -228,8 +284,17 @@ handle_packet({connect, ConnectData}, #state{socket = Socket, transport = Transp
             %% Authenticate through the configured auth backend. The result
             %% map has atom keys (kraken_auth:build_auth_data/1) and already
             %% carries the flattened allowed_topics.
-            case kraken_auth:validate_token(Token) of
+            case validate_session(Token) of
                 {ok, AuthData} ->
+                    OrgId = maps:get(organization_id, AuthData, undefined),
+                    ActorTokenId = maps:get(actor_token_id, AuthData),
+                    %% Counts against the organization's connection limit,
+                    %% exactly like a WebSocket connection
+                    syn:join(kraken_connections, {org, OrgId}, self(),
+                             #{actor_token_id => ActorTokenId}),
+                    schedule_token_expiry(maps:get(auth_expires_at, AuthData, undefined)),
+                    erlang:send_after(?REVALIDATION_INTERVAL_MS, self(), revalidate),
+
                     %% Connect to the broker backend
                     {ok, MqttClient} = kraken_broker:connect(),
 
@@ -241,8 +306,9 @@ handle_packet({connect, ConnectData}, #state{socket = Socket, transport = Transp
                     %% this packet handled (reset_keep_alive/1)
                     {ok, State#state{
                         authenticated = true,
-                        actor_token_id = maps:get(actor_token_id, AuthData),
-                        organization_id = maps:get(organization_id, AuthData, undefined),
+                        actor_token_id = ActorTokenId,
+                        organization_id = OrgId,
+                        max_connections = maps:get(max_connections, AuthData, unlimited),
                         project_id = maps:get(project_id, AuthData, undefined),
                         actor_type = maps:get(actor_type, AuthData, <<"device">>),
                         allowed_topics = maps:get(allowed_topics, AuthData, []),
@@ -250,6 +316,11 @@ handle_packet({connect, ConnectData}, #state{socket = Socket, transport = Transp
                         mqtt_client = MqttClient,
                         keep_alive = KeepAlive
                     }};
+                {error, connection_limit_reached} ->
+                    kraken_log:info("[MQTT] Connection limit reached, refusing CONNECT~n", []),
+                    Connack = kraken_mqtt_protocol:encode_connack(false, server_unavailable),
+                    Transport:send(Socket, Connack),
+                    {error, connection_limit_reached, State};
                 {error, Reason} ->
                     kraken_log:error("[MQTT] Auth failed: ~p~n", [Reason]),
                     Connack = kraken_mqtt_protocol:encode_connack(false, not_authorized),
@@ -423,6 +494,45 @@ handle_packet(_Packet, #state{authenticated = false} = State) ->
 %%====================================================================
 %% Helper Functions
 %%====================================================================
+
+%% Validate a CONNECT token with the same session rules as the WebSocket
+%% path: an expired client token is refused (the 30 s auth cache can serve
+%% an already-expired one), and so is a connection over the organization's
+%% limit.
+validate_session(Token) ->
+    case kraken_auth:validate_token(Token) of
+        {ok, AuthData} ->
+            ExpiresAt = maps:get(auth_expires_at, AuthData, undefined),
+            OrgId = maps:get(organization_id, AuthData, undefined),
+            MaxConn = maps:get(max_connections, AuthData, unlimited),
+            case is_integer(ExpiresAt) andalso erlang:system_time(second) >= ExpiresAt of
+                true ->
+                    {error, token_expired};
+                false ->
+                    case over_connection_limit(OrgId, MaxConn, 0) of
+                        true -> {error, connection_limit_reached};
+                        false -> {ok, AuthData}
+                    end
+            end;
+        Error ->
+            Error
+    end.
+
+%% Same count as kraken_ws_handler:check_connection_limit/2. Own is how many
+%% of the counted connections are this one (0 before it joins, 1 after).
+over_connection_limit(_OrgId, unlimited, _Own) -> false;
+over_connection_limit(undefined, _MaxConn, _Own) -> false;
+over_connection_limit(OrgId, MaxConn, Own) when is_integer(MaxConn) ->
+    Current = length(syn:members(kraken_connections, {org, OrgId})),
+    Current - Own >= MaxConn;
+over_connection_limit(_OrgId, _MaxConn, _Own) -> false.
+
+schedule_token_expiry(ExpiresAt) when is_integer(ExpiresAt) ->
+    Ms = max(0, (ExpiresAt - erlang:system_time(second)) * 1000),
+    erlang:send_after(Ms, self(), token_expired),
+    ok;
+schedule_token_expiry(_) ->
+    ok.
 
 generate_connection_id() ->
     list_to_binary(io_lib:format("mqtt-~s", [
