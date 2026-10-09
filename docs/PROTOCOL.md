@@ -38,6 +38,30 @@ treat an absent `protocolVersion` in the auth response as 1.
 { "type": "auth", "success": false, "error": "access_denied" | "connection_limit_reached" | "broker_unavailable" }
 ```
 
+### Reconnect restore
+
+With `"reconnect": true`, kraken restores the connection's earlier
+subscriptions before replying, and lists them in `restoredSubscriptions`.
+The source is the auth backend's `active_subscriptions` when it returns any
+(a control plane that persists the subscription reports). Otherwise kraken
+uses its own memory of the subscribe requests made under the same key: the
+actor token plus the optional `clientId` from the auth message. Those
+requests are replayed through the normal subscribe path, so current ACLs,
+scopes, filters (including `setFilters` changes) and load balancing apply;
+a topic the actor may no longer subscribe to is dropped.
+
+- Without a `clientId`, all connections of one actor share a key, so a
+  reconnect restores the union of their subscriptions. Send a `clientId` per
+  client instance to keep them apart.
+- A connect without `"reconnect": true` starts empty and drops what an
+  earlier, now-closed connection of the same key left behind.
+- The memory is held in RAM, cluster-wide: a reconnect that lands on another
+  node still finds it. It is kept while any connection holds the key and for
+  `resume_retention_ms` (default 3600000) after the last one closes. It does
+  not survive a restart of the node that held it: after a kraken restart,
+  clients must subscribe again (subscribing in the SDK's `connect` handler
+  covers both cases, and a repeated subscribe is harmless).
+
 ## Client → server messages
 
 | type | fields |

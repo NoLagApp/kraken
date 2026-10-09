@@ -61,6 +61,12 @@ release start).
 |-----|---------|---------|
 | `INTERNAL_SECRET` | `change_me` | shared secret for `POST /internal/publish` |
 
+## Reconnect restore (sys.config only)
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `resume_retention_ms` | `3600000` | How long kraken remembers a client's subscriptions after its last connection closes, for restore on `reconnect: true`. See PROTOCOL.md, "Reconnect restore". |
+
 ## Clustering
 
 | Var | Default | Meaning |

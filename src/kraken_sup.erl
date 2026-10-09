@@ -34,6 +34,7 @@ init([]) ->
         worker(kraken_lobby_map, []),
         worker(kraken_usage, []),
         worker(kraken_subscriptions, []),
+        worker(kraken_resume, []),
         worker(kraken_breaker, [])
     ],
 

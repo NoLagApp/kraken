@@ -10,10 +10,11 @@
 start(_StartType, _StartArgs) ->
     %% SYN scopes: presence, lobbies, per-org connection tracking, per-actor
     %% connection tracking (so a second connection for one actor does not take
-    %% over its MQTT session), and topic groups for the syn broker backend.
+    %% over its MQTT session), topic groups for the syn broker backend, and
+    %% the connections holding each reconnect-restore key (kraken_resume).
     syn:start(),
     syn:add_node_to_scopes([kraken_presence, kraken_lobbies, kraken_connections,
-                            kraken_actors, kraken_topics]),
+                            kraken_actors, kraken_topics, kraken_resume]),
 
     %% httpc connection pooling (used by misc outbound HTTP)
     httpc:set_options([

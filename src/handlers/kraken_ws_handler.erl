@@ -73,7 +73,9 @@
     scope_name :: binary() | undefined,
     %% Client-token (JWT) expiry in unix seconds. The connection is closed
     %% (4003) when this passes. undefined for opaque actor tokens.
-    auth_expires_at :: non_neg_integer() | undefined
+    auth_expires_at :: non_neg_integer() | undefined,
+    %% kraken_resume key ({ActorTokenId, ClientId}) for reconnect restore
+    resume_key :: term() | undefined
 }).
 
 %%====================================================================
@@ -360,8 +362,14 @@ terminate(Reason, _Req, #state{mqtt_client = MqttClient, current_room_id = RoomI
                                 persistent_presence = PersistentPresence,
                                 persistent_session = PersistentSession,
                                 allowed_topics = AllowedTopics,
+                                resume_key = ResumeKey,
                                 kraken_store = FirestoreWriter} = _State) ->
     kraken_log:info("[WS] Connection closed~n", []),
+    %% Keep this key's subscriptions restorable for the retention window
+    case ResumeKey of
+        undefined -> ok;
+        _ -> catch kraken_resume:connection_closed(ResumeKey)
+    end,
 
     %% Log disconnection to Firestore (only if authenticated)
     case Authenticated of
@@ -506,6 +514,16 @@ handle_message(#{<<"type">> := <<"auth">>, <<"token">> := Token} = Message, Stat
                 actor_token_id => ActorTokenIdForSyn
             }),
 
+            %% Reconnect restore memory (kraken_resume). A fresh connect drops
+            %% what an earlier, now-gone connection of this key left behind.
+            ResumeKey = kraken_resume:key(ActorTokenIdForSyn,
+                                          maps:get(<<"clientId">>, Message, undefined)),
+            case IsReconnect of
+                true -> ok;
+                false -> kraken_resume:fresh_connection(ResumeKey)
+            end,
+            kraken_resume:register_connection(ResumeKey),
+
             AllowedLobbies = maps:get(allowed_lobbies, AuthData, []),
             LobbySlugMap = build_lobby_slug_map(AllowedLobbies),
             MaxMsgSize = maps:get(max_message_size_bytes, AuthData, ?MAX_MESSAGE_SIZE),
@@ -533,7 +551,8 @@ handle_message(#{<<"type">> := <<"auth">>, <<"token">> := Token} = Message, Stat
                 scope_id = ScopeId,
                 scope_name = ScopeName,
                 protocol_version = NegotiatedVersion,
-                auth_expires_at = AuthExpiresAt
+                auth_expires_at = AuthExpiresAt,
+                resume_key = ResumeKey
             },
 
             %% Log connection success to Firestore
@@ -549,17 +568,27 @@ handle_message(#{<<"type">> := <<"auth">>, <<"token">> := Token} = Message, Stat
 
             %% Only restore subscriptions if this is a reconnect, not a fresh connect
             %% Fresh connects should start with no subscriptions - client will subscribe as needed
-            {RestoredSubscriptions, ResponseSubs} = case IsReconnect of
-                true ->
-                    ActiveSubscriptions = maps:get(active_subscriptions, AuthData, []),
-                    restore_subscriptions(MqttClient, ActiveSubscriptions, NewState, self()),
-                    {ActiveSubscriptions, ActiveSubscriptions};
-                false ->
-                    {[], []}
+            ActiveSubscriptions = case IsReconnect of
+                true -> maps:get(active_subscriptions, AuthData, []);
+                false -> []
             end,
+            restore_subscriptions(MqttClient, ActiveSubscriptions, NewState, self()),
 
             %% Collect pending filter state from restore_subscriptions
-            StateWithFilters = collect_pending_filters(NewState),
+            StateWithFilters0 = collect_pending_filters(NewState),
+
+            %% When the auth backend persists nothing (static auth, the
+            %% nolag-core example host), restore from kraken's own memory of
+            %% this key's subscribe requests, replayed through the normal
+            %% subscribe path so ACLs, scopes and filters apply as today.
+            {StateWithFilters, ResponseSubs} =
+                case IsReconnect andalso ActiveSubscriptions =:= [] of
+                    true ->
+                        replay_remembered_subscriptions(
+                            kraken_resume:take(ResumeKey), StateWithFilters0);
+                    false ->
+                        {StateWithFilters0, ActiveSubscriptions}
+                end,
 
             Response = #{
                 <<"type">> => <<"auth">>,
@@ -813,6 +842,7 @@ handle_message(#{<<"type">> := <<"subscribe">>, <<"topic">> := Pattern} = Messag
                             TrackMetadata
                     end,
                     kraken_subscriptions:track(ActorTokenId, Pattern, subscribe, TrackMetadata1),
+                    kraken_resume:remember(State#state.resume_key, Pattern, Message),
 
                     %% Call hydration webhook if configured (async)
                     %% Per-topic webhook takes precedence, fallback to app-level
@@ -911,6 +941,7 @@ handle_message(#{<<"type">> := <<"unsubscribe">>, <<"topic">> := Pattern},
     NewTopicFilters = maps:remove(Pattern, State#state.topic_filters),
     %% Persist unsubscription to Titus (async) - use pattern for tracking
     kraken_subscriptions:track(ActorTokenId, Pattern, unsubscribe),
+    kraken_resume:forget(State#state.resume_key, Pattern),
     Response = #{
         <<"type">> => <<"unsubscribed">>,
         <<"topic">> => Pattern
@@ -1010,6 +1041,7 @@ handle_message(#{<<"type">> := <<"setFilters">>, <<"topic">> := Pattern, <<"filt
                         _ -> #{filters => NewFilterList}
                     end,
                     kraken_subscriptions:track(ActorTokenId, Pattern, subscribe, TrackMetadata),
+                    kraken_resume:update_filters(State#state.resume_key, Pattern, NewFilterList),
 
                     Response = #{
                         <<"type">> => <<"filtersUpdated">>,
@@ -1415,6 +1447,32 @@ handle_message(Message, State) ->
 %%====================================================================
 %% Internal functions
 %%====================================================================
+
+%% Replay subscribe requests remembered by kraken_resume (on reconnect),
+%% through the normal subscribe handler so ACLs, scope injection, filters
+%% and load balancing behave exactly as for a live subscribe. A request the
+%% actor may no longer make is dropped (and so not remembered again).
+%% Returns the resulting state and the requests that were restored.
+replay_remembered_subscriptions(Requests, State) ->
+    {FinalState, Restored} = lists:foldl(fun(Request, {AccState, AccRestored}) ->
+        Topic = maps:get(<<"topic">>, Request),
+        Result = (catch handle_message(Request#{<<"type">> => <<"subscribe">>}, AccState)),
+        NextState = case Result of
+            {reply, _Frames, S} when is_record(S, state) -> S;
+            {ok, S} when is_record(S, state) -> S;
+            _ -> AccState
+        end,
+        case get({mqtt_topics_for, Topic}) of
+            undefined -> {NextState, AccRestored};
+            _ -> {NextState, [Request | AccRestored]}
+        end
+    end, {State, []}, Requests),
+    case Restored of
+        [] -> ok;
+        _ -> kraken_log:info("[WS] Restored ~p subscription(s) for ~s from kraken_resume",
+                             [length(Restored), State#state.actor_token_id])
+    end,
+    {FinalState, lists:reverse(Restored)}.
 
 %% Restore subscriptions from Titus (on reconnect)
 %% Subscriptions can be simple topic names (strings) or maps with load balance info
