@@ -1,6 +1,6 @@
 {application, kraken, [
     {description, "Kraken - pluggable realtime pub/sub proxy (auth, broker, store and control-plane backends)"},
-    {vsn, "0.9.0"},  %% persistent sessions speak MQTT 5 so the configured session expiry actually reaches the broker; previously it was silently dropped and sessions never expired
+    {vsn, "0.9.1"},  %% MQTT ingress accepts connections; subscriptions restored on reconnect without a control plane; presence stays inside access scopes; gossip/dns cluster discovery work and the cookie is no longer logged
     {registered, []},
     {mod, {kraken_app, []}},
     {applications, [
