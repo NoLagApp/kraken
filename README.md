@@ -3,8 +3,7 @@
 **A pluggable realtime pub/sub proxy.** Kraken is the simplification layer for
 realtime messaging: actor-token auth, topic ACLs, rooms, presence, lobbies,
 per-message QoS with acks, webhooks and a fixed 50 messages/s per-connection
-limit, over a compact MessagePack WebSocket protocol (plus an MQTT ingress
-listener for devices).
+limit, over a compact MessagePack WebSocket protocol.
 
 Everything behind that layer is a **plugin**:
 
@@ -88,7 +87,10 @@ compose stack that runs it in front of kraken.
 ## Features
 
 - **Wire protocol**: MessagePack over WebSocket; see [docs/PROTOCOL.md](docs/PROTOCOL.md)
-- **MQTT ingress**: devices can connect over MQTT 3.1.1 (port 1883)
+- **MQTT ingress (not working in v0.9.0)**: kraken opens an MQTT 3.1.1
+  listener on port 1883, but every connection fails to start: the handler
+  exports `start_link/3` while the pinned ranch 1.8 calls `start_link/4`.
+  Connect devices with an SDK or the WebSocket protocol until this is fixed.
 - **Auth**: token validation via static file or HTTP callback, with a 30s
   cache and periodic revalidation; per-token topic ACLs and a per-organization
   limit on WebSocket connections
@@ -100,7 +102,9 @@ compose stack that runs it in front of kraken.
   to the Store while recording is on
 - **Echo control, per-subscription filters, load-balanced subscriptions**
 - **Webhooks**: hydration + trigger webhooks per topic
-- **Clustering**: dns / epmd / gossip discovery (Erlang distribution)
+- **Clustering**: Erlang distribution with `epmd` (a fixed host list) or `dns`
+  discovery (`CLUSTER_DNS_QUERY` + `CLUSTER_NODE_BASENAME`). The `gossip`
+  strategy is accepted but did not form a cluster in testing; do not use it.
 - **Embeddable**: use kraken as a rebar3 dependency and provide your own
   backend modules; see [docs/PLUGINS.md](docs/PLUGINS.md)
 

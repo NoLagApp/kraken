@@ -8,7 +8,7 @@ release start).
 | Var | Default | Meaning |
 |-----|---------|---------|
 | `WS_PORT` | `8080` | WebSocket (`/ws`) + HTTP (`/health`) |
-| `MQTT_PORT` | `1883` | MQTT ingress listener |
+| `MQTT_PORT` | `1883` | MQTT ingress listener. Accepts no connections in v0.9.0 (the handler exports `start_link/3`; ranch 1.8 calls `start_link/4`) |
 
 ## Backends
 
@@ -84,8 +84,10 @@ value or block the route at your reverse proxy.
 
 | Var | Default | Meaning |
 |-----|---------|---------|
-| `CLUSTER_STRATEGY` | `standalone` | `standalone`, `dns`, `epmd`, `gossip` |
-| `CLUSTER_DNS_NAME` | (unset) | DNS name resolving to peer IPs (dns) |
+| `CLUSTER_STRATEGY` | `standalone` | `standalone`, `dns`, `epmd`, `gossip` (gossip did not form a cluster in testing; use `epmd` or `dns`) |
+| `CLUSTER_DNS_QUERY` | (unset) | DNS name resolving to peer IPs (dns). Read directly from the environment |
+| `CLUSTER_NODE_BASENAME` | `kraken_proxy` | Node name prefix for dns peers: kraken connects to `<basename>@<ip>`. Set it to match `ERLANG_NODE_NAME` |
+| `CLUSTER_DNS_NAME` | (unset) | Mapped into sys.config but not read by v0.9.0; use `CLUSTER_DNS_QUERY` |
 | `CLUSTER_HOSTS` | (unset) | comma-separated node names (epmd) |
 | `CLUSTER_GOSSIP_PORT` / `CLUSTER_GOSSIP_SECRET` | `45892` / (unset) | gossip multicast |
 | `ERLANG_NODE_NAME` | `kraken@127.0.0.1` | **longnames: host part must be an FQDN or IP** |
