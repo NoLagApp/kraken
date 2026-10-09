@@ -1803,9 +1803,11 @@ check_rate_limit(State) ->
             {ok, State#state{msg_count = 1, rate_limit_second = CurrentSecond}}
     end.
 
-%% Pack message with binary keys as strings for JS compatibility
+%% Pack message with binary keys as strings for JS compatibility. Data that
+%% is not valid UTF-8 (an MQTT client's binary payload, say) is packed as
+%% MessagePack bin instead of failing (kraken_msgpack).
 pack_msg(Map) ->
-    iolist_to_binary(msgpack:pack(Map, [{pack_str, from_binary}])).
+    iolist_to_binary(kraken_msgpack:pack(Map)).
 
 %% Async revalidation - called in spawned process
 %% Sends result back to WebSocket handler process
