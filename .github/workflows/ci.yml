@@ -42,6 +42,11 @@ jobs:
           cd ../js-sdk && npm ci && npm run build
 
       - name: Start kraken
+        # The control backend points at e2e/publish.mjs's receiver so failed
+        # webhooks' DLQ reports can be asserted; the other suites ignore it.
+        env:
+          CONTROL_BACKEND: http
+          CONTROL_HTTP_URL: http://host.docker.internal:18099
         run: docker compose -f e2e/docker-compose.e2e.yml -p kraken-e2e up -d --build
 
       - name: Wait for healthy
@@ -52,3 +57,4 @@ jobs:
           [ -d ../js-sdk/dist ] || { echo "js-sdk unavailable, skipping e2e"; exit 0; }
           node e2e/run.mjs
           node e2e/characterize-topics.mjs
+          node e2e/publish.mjs

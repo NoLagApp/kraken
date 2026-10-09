@@ -16,7 +16,7 @@
     format_shared_subscription/2, supports_load_balancing/0, capabilities/0
 ]).
 %% Test helpers
--export([reset/0, fail/1, unsubscribed/0]).
+-export([reset/0, fail/1, unsubscribed/0, published/0]).
 
 -define(TAB, lb_test_broker_tab).
 
@@ -43,6 +43,11 @@ unsubscribed() ->
     ensure(),
     [T || {{seq, _N}, T} <- ets:tab2list(?TAB)].
 
+%% Publishes, in call order, as {Topic, Payload, Sender, QoS, Retain}.
+published() ->
+    ensure(),
+    [P || {{pub, _N}, P} <- ets:tab2list(?TAB)].
+
 %%====================================================================
 %% kraken_broker
 %%====================================================================
@@ -66,7 +71,11 @@ unsubscribe(_Session, Topic) ->
             ok
     end.
 
-publish(_Session, _Topic, _Data, _Sender, _QoS, _Retain) -> ok.
+publish(_Session, Topic, Data, Sender, QoS, Retain) ->
+    ensure(),
+    N = ets:update_counter(?TAB, pub_counter, {2, 1}, {pub_counter, 0}),
+    ets:insert(?TAB, {{pub, N}, {Topic, Data, Sender, QoS, Retain}}),
+    ok.
 disconnect(_Session) -> ok.
 
 format_shared_subscription(BaseTopic, Group) ->

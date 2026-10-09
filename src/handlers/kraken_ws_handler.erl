@@ -208,28 +208,28 @@ websocket_info({mqtt_publish, #{topic := MqttTopic, payload := Payload} = Delive
     %% Decode the payload (it's msgpack encoded)
     case msgpack:unpack(Payload, [{unpack_str, as_binary}]) of
         {ok, Decoded} ->
-            %% Extract msgId and actual data if present (for delivery tracking)
-            {MsgId, ActualPayload} = extract_msg_id_and_data(Decoded),
+            %% Extract msgId, the broker-stamped sender and the actual data
+            {MsgId, From, ActualPayload} = kraken_publish:unwrap(Decoded),
             %% Check if this is a no-echo envelope with sender info
             case ActualPayload of
                 #{<<"_sender">> := Sender, <<"data">> := _} when Sender =:= ConnectionId ->
                     %% Message is from this connection and echo=false, drop it
                     {ok, State};
-                #{<<"_sender">> := Sender, <<"data">> := InnerData} ->
+                #{<<"_sender">> := _Sender, <<"data">> := InnerData} ->
                     %% Message has sender info but it's from another connection, forward it
                     maybe_log_delivery(FirestoreWriter, MsgId, ActorTokenId, DisplayTopic),
                     kraken_lb:claim_live(MsgId, DisplayTopic, ActorTokenId),
-                    forward_message_with_filter(DisplayTopic, InnerData, MsgId, FilterValue, State);
+                    forward_message_with_filter(DisplayTopic, InnerData, MsgId, From, FilterValue, State);
                 _ ->
                     %% Regular message without sender info (echo=true), forward as-is
                     maybe_log_delivery(FirestoreWriter, MsgId, ActorTokenId, DisplayTopic),
                     kraken_lb:claim_live(MsgId, DisplayTopic, ActorTokenId),
-                    forward_message_with_filter(DisplayTopic, ActualPayload, MsgId, FilterValue, State)
+                    forward_message_with_filter(DisplayTopic, ActualPayload, MsgId, From, FilterValue, State)
             end;
         {error, DecodeError} ->
             %% Decode failed, send raw
             kraken_log:info("[WS] Msgpack decode error: ~p~n", [DecodeError]),
-            forward_message_with_filter(DisplayTopic, Payload, undefined, FilterValue, State)
+            forward_message_with_filter(DisplayTopic, Payload, undefined, undefined, FilterValue, State)
     end;
 
 %% Legacy format (in case it's still used somewhere)
@@ -1061,7 +1061,7 @@ handle_message(#{<<"type">> := <<"setFilters">>, <<"topic">> := Pattern, <<"filt
     end;
 
 %% Handle publish message
-handle_message(#{<<"type">> := <<"publish">>, <<"topic">> := Pattern, <<"data">> := Data} = Message,
+handle_message(#{<<"type">> := <<"publish">>, <<"topic">> := Pattern, <<"data">> := _} = Message,
                #state{authenticated = true, mqtt_client = MqttClient,
                       actor_token_id = ActorTokenId, connection_id = ConnectionId,
                       allowed_topics = AllowedTopics, apps = Apps,
@@ -1079,31 +1079,6 @@ handle_message(#{<<"type">> := <<"publish">>, <<"topic">> := Pattern, <<"data">>
             },
             {reply, {binary, pack_msg(with_msg_ref(Response, Message))}, State1};
         {ok, State1} ->
-            %% Check message size against the flat 900KB platform ceiling
-            PackedData = kraken_msgpack:pack(Data),
-            DataSize = iolist_size(PackedData),
-            case DataSize > ?MAX_MESSAGE_SIZE of
-                true ->
-                    SizeResponse = #{
-                        <<"type">> => <<"error">>,
-                        <<"code">> => 42930,
-                        <<"error">> => <<"message_too_large">>,
-                        <<"topic">> => Pattern,
-                        <<"maxSizeBytes">> => ?MAX_MESSAGE_SIZE
-                    },
-                    {reply, {binary, pack_msg(with_msg_ref(SizeResponse, Message))}, State1};
-                false ->
-            %% Check monthly message quota
-            case kraken_usage:is_project_blocked(ProjectId) of
-                true ->
-                    QuotaResponse = #{
-                        <<"type">> => <<"error">>,
-                        <<"code">> => 42920,
-                        <<"error">> => <<"monthly_quota_exceeded">>,
-                        <<"topic">> => Pattern
-                    },
-                    {reply, {binary, pack_msg(with_msg_ref(QuotaResponse, Message))}, State1};
-                false ->
             EffPubPattern = maybe_inject_scope(Pattern, ScopeSlug, AllowedTopics),
             case kraken_acl:can_publish(EffPubPattern, AllowedTopics) of
                 true ->
@@ -1121,106 +1096,54 @@ handle_message(#{<<"type">> := <<"publish">>, <<"topic">> := Pattern, <<"data">>
                                 FT0 = kraken_topics:fallback_topic(<<"unscoped">>, EffPubPattern),
                                 {FT0, undefined, undefined, <<"unscoped">>}
                         end,
-                    App = find_app_by_id(AppId, Apps),
-
-                    %% Append filter to MQTT topic if specified
-                    %% Supports both singular filter (string) and filters (array for AND composite)
-                    Filter = maps:get(<<"filter">>, Message, undefined),
-                    Filters = maps:get(<<"filters">>, Message, undefined),
-                    CompositeFilter = case {Filter, Filters} of
-                        {F, _} when is_binary(F), F =/= <<>> -> F;
-                        {_, Fs} when is_list(Fs), length(Fs) > 0 ->
-                            Lowered = [string:lowercase(F0) || F0 <- Fs, is_binary(F0)],
-                            Sorted = lists:sort(Lowered),
-                            iolist_to_binary(lists:join(<<"|">>, Sorted));
-                        _ -> undefined
-                    end,
-                    MqttTopic = case CompositeFilter of
-                        undefined -> MqttBaseTopic0;
-                        null -> MqttBaseTopic0;
-                        <<>> -> MqttBaseTopic0;
-                        _ -> <<MqttBaseTopic0/binary, "/", CompositeFilter/binary>>
-                    end,
-
-                    %% Build context for Firestore logging
-                    LogContext = #{
+                    Ctx = #{
+                        sender => #{type => actor, id => ActorTokenId,
+                                    actor_type => State#state.actor_type},
                         organization_id => OrganizationId,
                         project_id => ProjectId,
+                        app => find_app_by_id(AppId, Apps),
                         app_id => AppId,
-                        room_id => RoomId
+                        room_id => RoomId,
+                        broker_topic => MqttBaseTopic0,
+                        internal_topic => InternalTopic,
+                        pattern => Pattern,
+                        room_name => extract_room_name(Pattern, AllowedTopics),
+                        scope => scope_of(State),
+                        broker_session => MqttClient,
+                        %% echo=false: the broker tags the publish with this
+                        %% connection so delivery can drop it here.
+                        echo_sender => case maps:get(<<"echo">>, Message, true) of
+                            false -> ConnectionId;
+                            _ -> undefined
+                        end,
+                        store => FirestoreWriter,
+                        %% The flat platform ceiling, as before; plan limits
+                        %% are enforced by the control plane.
+                        max_message_size => ?MAX_MESSAGE_SIZE,
+                        fire_webhooks => true
                     },
-
-                    %% Record message if enabled and get MessageId
-                    %% Use internal topic (room_uuid based) for storage to ensure uniqueness
-                    {_, MessageId} = maybe_record_message(FirestoreWriter, Pattern, InternalTopic, Data, iolist_to_binary(PackedData), LogContext, ActorTokenId),
-                    %% Check echo option (default true)
-                    Echo = maps:get(<<"echo">>, Message, true),
-                    %% Build payload with optional msgId for delivery tracking
-                    PayloadWithMsgId = case MessageId of
-                        undefined -> Data;
-                        _ -> #{<<"_msgId">> => MessageId, <<"_data">> => Data}
-                    end,
-                    %% Extract QoS from client message (default 1), validate 0-2
-                    ReqQoS = maps:get(<<"qos">>, Message, 1),
-                    QoS = case ReqQoS of
-                        N when is_integer(N), N >= 0, N =< 2 -> N;
-                        _ -> 1
-                    end,
-                    %% Check retain option
-                    Retain = maps:get(<<"retain">>, Message, false),
-                    %% Publish to EMQX with connection ID if echo=false (for per-connection filtering)
-                    %% Use internal topic (room_uuid/topic_name) for MQTT isolation
-                    case Echo of
-                        false ->
-                            ok = kraken_broker:publish(MqttClient, MqttTopic, PayloadWithMsgId, ConnectionId, QoS, Retain);
-                        _ ->
-                            ok = kraken_broker:publish(MqttClient, MqttTopic, PayloadWithMsgId, undefined, QoS, Retain)
-                    end,
-
-                    %% Call trigger webhook if configured (async)
-                    %% Per-topic webhook takes precedence, fallback to app-level
-                    case App of
-                        undefined -> ok;
-                        _ ->
-                            TopicName1 = extract_topic_name(Pattern),
-                            TopicWebhooks1 = maps:get(<<"topic_webhooks">>, App, #{}),
-                            TopicWebhookConfig1 = maps:get(TopicName1, TopicWebhooks1, #{}),
-                            TriggerWebhook = case maps:get(<<"on_publish">>, TopicWebhookConfig1, null) of
-                                null -> maps:get(<<"trigger_webhook">>, App, null);
-                                Wh1 -> Wh1
-                            end,
-                            case TriggerWebhook of
-                                null -> ok;
-                                undefined -> ok;
-                                WebhookConfig when is_map(WebhookConfig) ->
-                                    RoomName = extract_room_name(Pattern, AllowedTopics),
-                                    DlqContext = #{
-                                        organization_id => OrganizationId,
-                                        project_id => ProjectId,
-                                        app_id => AppId
+                    case kraken_publish:publish(Ctx, Message) of
+                        {ok, _MessageId} ->
+                            %% v2 publish ack: only when the client supplied a msgRef
+                            case maps:get(<<"msgRef">>, Message, undefined) of
+                                MsgRef when is_binary(MsgRef), MsgRef =/= <<>> ->
+                                    AckResp = #{
+                                        <<"type">> => <<"published">>,
+                                        <<"topic">> => Pattern,
+                                        <<"msgRef">> => MsgRef
                                     },
-                                    ScopeInfo1 = build_scope_info(State),
-                                    kraken_webhooks:call_trigger(WebhookConfig, DlqContext, ActorTokenId, RoomName, TopicName1, Data, ScopeInfo1)
-                            end
-                    end,
-
-                    %% Persistent Presence: wake offline persistent subscribers in this room
-                    %% (the message is queued on their persistent session; wake brings them
-                    %% back online to drain it). Detached by construction — see the
-                    %% hot-path contract in kraken_presence_store.
-                    kraken_presence_store:wake_offline_async(RoomId, AppId),
-
-                    %% v2 publish ack: only when the client supplied a msgRef
-                    case maps:get(<<"msgRef">>, Message, undefined) of
-                        MsgRef when is_binary(MsgRef), MsgRef =/= <<>> ->
-                            AckResp = #{
-                                <<"type">> => <<"published">>,
-                                <<"topic">> => Pattern,
-                                <<"msgRef">> => MsgRef
-                            },
-                            {reply, {binary, pack_msg(AckResp)}, State1};
-                        _ ->
-                            {ok, State1}
+                                    {reply, {binary, pack_msg(AckResp)}, State1};
+                                _ ->
+                                    {ok, State1}
+                            end;
+                        {error, {Code, Reason, Extra}} ->
+                            ErrResp = maps:merge(Extra, #{
+                                <<"type">> => <<"error">>,
+                                <<"code">> => Code,
+                                <<"error">> => Reason,
+                                <<"topic">> => Pattern
+                            }),
+                            {reply, {binary, pack_msg(with_msg_ref(ErrResp, Message))}, State1}
                     end;
                 false ->
                     %% Unknown/unauthorized room → LOUD (no implicit creation
@@ -1230,8 +1153,6 @@ handle_message(#{<<"type">> := <<"publish">>, <<"topic">> := Pattern, <<"data">>
                         Message),
                     {reply, {binary, pack_msg(ErrFrame)}, State1}
             end
-            end %% end is_project_blocked
-            end %% end message_size check
     end;
 
 %% Handle room presence update (NEW: requires roomId)
@@ -1638,73 +1559,6 @@ restore_subscriptions(MqttClient, [Subscription | Rest], State, WsPid) ->
     end,
     restore_subscriptions(MqttClient, Rest, State, WsPid).
 
-notify_usage(undefined, _Bytes) -> ok;
-notify_usage(ProjectId, Bytes) ->
-    catch kraken_usage:increment(ProjectId, 1, Bytes).
-
-%% Record message and return {ok, MessageId} or {skip, undefined}
-%% Pattern = human-readable topic (e.g., app/room/topic)
-%% InternalTopic = UUID-based topic for Firestore (e.g., room_uuid/topic)
-%% PackedPayload = msgpack-encoded payload binary (stored as Firestore bytesValue)
-%% Context = #{organization_id, project_id, app_id, room_id}
-maybe_record_message(FirestoreWriter, Pattern, InternalTopic, Data, PackedPayload, Context, ActorTokenId) ->
-    %% Always track usage regardless of whether message recording is enabled
-    ProjectId = maps:get(project_id, Context, undefined),
-    PayloadBytes = byte_size(jsx:encode(Data)),
-    notify_usage(ProjectId, PayloadBytes),
-
-    RecordMessages = application:get_env(kraken, record_messages, false),
-    %% Handle both atom and string values from config
-    ShouldRecord = case RecordMessages of
-        true -> true;
-        "true" -> true;
-        <<"true">> -> true;
-        _ -> false
-    end,
-    case ShouldRecord of
-        true ->
-            MessageId = generate_uuid(),
-            Timestamp = erlang:system_time(millisecond),
-            %% Use internal topic for Firestore storage (ensures uniqueness across projects)
-            %% Context includes org/project/app/room IDs for proper scoping
-            kraken_store:log_message(FirestoreWriter, MessageId, Context, InternalTopic, Pattern, ActorTokenId, PackedPayload, Timestamp),
-            {ok, MessageId};
-        false ->
-            {skip, undefined}
-    end.
-
-%% Generate a UUID v4
-generate_uuid() ->
-    <<A:32, B:16, C:16, D:16, E:48>> = crypto:strong_rand_bytes(16),
-    %% Set version to 4 and variant to RFC 4122
-    C2 = (C band 16#0fff) bor 16#4000,
-    D2 = (D band 16#3fff) bor 16#8000,
-    list_to_binary(io_lib:format("~8.16.0b-~4.16.0b-~4.16.0b-~4.16.0b-~12.16.0b",
-                                  [A, B, C2, D2, E])).
-
-%% Extract msgId and data from payload (for delivery tracking)
-%% Handle various payload structures:
-%% 1. #{_msgId, _data} - direct message with tracking
-%% 2. #{_sender, data => #{_msgId, _data}} - no-echo with tracking
-%% 3. #{_sender, data} - no-echo without tracking
-%% 4. Other - plain message without tracking
-extract_msg_id_and_data(#{<<"_msgId">> := MsgId, <<"_data">> := Data}) ->
-    %% Direct message with tracking
-    {MsgId, Data};
-extract_msg_id_and_data(#{<<"_sender">> := Sender, <<"data">> := InnerData}) ->
-    %% No-echo envelope - check if inner data has msgId
-    case InnerData of
-        #{<<"_msgId">> := MsgId, <<"_data">> := ActualData} ->
-            %% No-echo with tracking - rebuild envelope with actual data
-            {MsgId, #{<<"_sender">> => Sender, <<"data">> => ActualData}};
-        _ ->
-            %% No-echo without tracking
-            {undefined, #{<<"_sender">> => Sender, <<"data">> => InnerData}}
-    end;
-extract_msg_id_and_data(Data) ->
-    %% Plain message without tracking
-    {undefined, Data}.
-
 %% Log delivery to Firestore if msgId is present
 maybe_log_delivery(_FirestoreWriter, undefined, _ActorTokenId, _Topic) ->
     ok;
@@ -1931,6 +1785,11 @@ extract_topic_name(FullTopic) ->
             FullTopic
     end.
 
+%% The connection's scope as the publish pipeline carries it.
+scope_of(#state{scope_slug = undefined}) -> undefined;
+scope_of(#state{scope_id = ScopeId, scope_slug = ScopeSlug, scope_name = ScopeName}) ->
+    #{id => ScopeId, slug => ScopeSlug, name => ScopeName}.
+
 %% Build scope info map for webhook payloads
 %% Returns null for unscoped actors, map with scope details for scoped actors
 build_scope_info(#state{scope_slug = undefined}) -> null;
@@ -2067,9 +1926,11 @@ extract_share_prefix([FirstTopic | _]) ->
         _ -> undefined
     end.
 
-%% Forward message to WebSocket client with optional filter value
-forward_message_with_filter(Topic, Data, MsgId, FilterValue, State) ->
-    BaseResponse = case MsgId of
+%% Forward message to WebSocket client with optional filter value. `from` and
+%% `fromType` carry the broker-stamped sender; clients that don't know the
+%% fields ignore them.
+forward_message_with_filter(Topic, Data, MsgId, From, FilterValue, State) ->
+    BaseResponse0 = case MsgId of
         undefined ->
             #{
                 <<"type">> => <<"message">>,
@@ -2085,6 +1946,7 @@ forward_message_with_filter(Topic, Data, MsgId, FilterValue, State) ->
                 <<"requiresAck">> => true
             }
     end,
+    BaseResponse = maps:merge(BaseResponse0, kraken_publish:sender_fields(From)),
     Response = case FilterValue of
         undefined -> BaseResponse;
         _ -> maps:put(<<"filter">>, FilterValue, BaseResponse)

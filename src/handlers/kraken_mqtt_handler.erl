@@ -427,20 +427,37 @@ handle_packet({publish, PublishData}, #state{authenticated = true, mqtt_client =
                                 FT0 = kraken_topics:fallback_topic(<<"unscoped">>, Topic),
                                 {FT0, undefined, undefined, <<"unscoped">>}
                         end,
-
-                    %% Log to Firestore if enabled
-                    LogContext = #{
+                    %% The shared pipeline: same envelope (the device's payload
+                    %% under _data, the broker's _from beside it), quota and
+                    %% size checks as a WebSocket publish. Webhooks stay off
+                    %% for MQTT ingress, as before. The payload bytes travel as
+                    %% one opaque binary; echo_sender keeps the message from
+                    %% being delivered back to this connection.
+                    Ctx = #{
+                        sender => #{type => actor, id => ActorTokenId,
+                                    actor_type => State#state.actor_type},
                         organization_id => OrganizationId,
                         project_id => ProjectId,
+                        app => undefined,
                         app_id => AppId,
-                        room_id => RoomId
+                        room_id => RoomId,
+                        broker_topic => MqttTopic,
+                        internal_topic => InternalTopic,
+                        pattern => Topic,
+                        scope => undefined,
+                        broker_session => MqttClient,
+                        echo_sender => ConnectionId,
+                        store => FirestoreWriter,
+                        max_message_size => ?MAX_MESSAGE_SIZE,
+                        fire_webhooks => false
                     },
-                    maybe_record_message(FirestoreWriter, Topic, InternalTopic, Payload, LogContext, ActorTokenId),
-
-                    %% Publish the payload bytes as one opaque binary. Sender =
-                    %% this connection, so the broker's no-echo envelope keeps
-                    %% the message from being delivered back here.
-                    ok = kraken_broker:publish(MqttClient, MqttTopic, Payload, ConnectionId, QoS),
+                    case kraken_publish:publish(Ctx, #{<<"data">> => Payload, <<"qos">> => QoS}) of
+                        {ok, _} -> ok;
+                        {error, {_Code, Reason, _}} ->
+                            %% MQTT 3.1.1 has no publish NACK; log and ack as for a denial.
+                            kraken_log:info("[MQTT] Publish to ~s rejected (actor ~s): ~s~n",
+                                [Topic, ActorTokenId, Reason])
+                    end,
 
                     ack_publish(QoS, PacketId, State1),
                     {ok, State1};
@@ -620,38 +637,37 @@ display_topic(PublishedTopic, Subscriptions) ->
 %% Bytes to deliver to an MQTT subscriber for a broker payload, or drop when
 %% the message was published by this same connection (no-echo).
 %%
-%% Broker payloads are MessagePack: the data itself, optionally wrapped in a
-%% delivery-tracking #{_msgId, _data} map, optionally inside a no-echo
-%% #{data, _sender} envelope. The wrappers are removed; binary data is sent
-%% as its raw bytes and any other data as its MessagePack encoding. A payload
-%% that is not MessagePack at all (published to an external broker by
-%% something other than kraken) is forwarded untouched.
+%% Broker payloads are MessagePack: the publish pipeline's envelope
+%% #{_data, _from, _msgId?} (older nodes: #{_msgId, _data}, or the bare data),
+%% optionally inside a no-echo #{data, _sender} wrapper. kraken_publish:unwrap/1
+%% removes the envelope; binary data is sent as its raw bytes and any other
+%% data as its MessagePack encoding. A payload that is not MessagePack at all
+%% (published to an external broker by something other than kraken) is
+%% forwarded untouched.
 -spec delivery_payload(binary(), binary() | undefined) -> {ok, binary()} | drop.
 delivery_payload(Packed, ConnectionId) ->
     case catch msgpack:unpack(Packed, [{unpack_str, as_binary}]) of
         {ok, Decoded} ->
-            case unwrap(Decoded) of
-                {Sender, _Data} when is_binary(Sender), Sender =:= ConnectionId ->
+            case kraken_publish:unwrap(Decoded) of
+                {_MsgId, _From, #{<<"_sender">> := Sender}}
+                  when is_binary(Sender), Sender =:= ConnectionId ->
                     drop;
-                {_Sender, Data} when is_binary(Data) ->
-                    {ok, Data};
-                {_Sender, Data} ->
-                    case kraken_msgpack:pack(Data) of
-                        Bytes when is_binary(Bytes) -> {ok, Bytes};
-                        {error, _} -> {ok, Packed}
-                    end
+                {_MsgId, _From, #{<<"_sender">> := _, <<"data">> := Data}} ->
+                    delivery_bytes(Data, Packed);
+                {_MsgId, _From, Data} ->
+                    delivery_bytes(Data, Packed)
             end;
         _ ->
             {ok, Packed}
     end.
 
-unwrap(#{<<"_sender">> := Sender, <<"data">> := Inner}) ->
-    {Sender, strip_msg_id(Inner)};
-unwrap(Decoded) ->
-    {undefined, strip_msg_id(Decoded)}.
-
-strip_msg_id(#{<<"_msgId">> := _MsgId, <<"_data">> := Data}) -> Data;
-strip_msg_id(Data) -> Data.
+delivery_bytes(Data, _Packed) when is_binary(Data) ->
+    {ok, Data};
+delivery_bytes(Data, Packed) ->
+    case kraken_msgpack:pack(Data) of
+        Bytes when is_binary(Bytes) -> {ok, Bytes};
+        {error, _} -> {ok, Packed}
+    end.
 
 has_wildcard(Topic) ->
     binary:match(Topic, [<<"+">>, <<"#">>]) =/= nomatch.
@@ -676,40 +692,3 @@ check_rate_limit(State) ->
             {ok, State#state{msg_count = 1, rate_limit_second = CurrentSecond}}
     end.
 
-notify_usage(undefined, _Bytes) -> ok;
-notify_usage(ProjectId, Bytes) ->
-    catch kraken_usage:increment(ProjectId, 1, Bytes).
-
-%% Record message to Firestore if enabled. Payload is the raw MQTT payload.
-maybe_record_message(FirestoreWriter, Pattern, InternalTopic, Payload, Context, ActorTokenId) ->
-    %% Always track usage regardless of whether message recording is enabled
-    ProjectId = maps:get(project_id, Context, undefined),
-    notify_usage(ProjectId, byte_size(Payload)),
-
-    RecordMessages = application:get_env(kraken, record_messages, false),
-    ShouldRecord = case RecordMessages of
-        true -> true;
-        "true" -> true;
-        <<"true">> -> true;
-        _ -> false
-    end,
-    case ShouldRecord of
-        true ->
-            MessageId = generate_uuid(),
-            Timestamp = erlang:system_time(millisecond),
-            %% Pack only when recording, with the same encoding the broker
-            %% uses, so stored bytes do not depend on the ingress protocol
-            PackedPayload = kraken_msgpack:pack(Payload),
-            kraken_store:log_message(FirestoreWriter, MessageId, Context, InternalTopic, Pattern, ActorTokenId, PackedPayload, Timestamp),
-            {ok, MessageId};
-        false ->
-            {skip, undefined}
-    end.
-
-%% Generate a UUID v4
-generate_uuid() ->
-    <<A:32, B:16, C:16, D:16, E:48>> = crypto:strong_rand_bytes(16),
-    C2 = (C band 16#0fff) bor 16#4000,
-    D2 = (D band 16#3fff) bor 16#8000,
-    list_to_binary(io_lib:format("~8.16.0b-~4.16.0b-~4.16.0b-~4.16.0b-~12.16.0b",
-                                  [A, B, C2, D2, E])).

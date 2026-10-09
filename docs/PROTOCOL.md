@@ -100,7 +100,8 @@ and every publish-path error frame echoes the `msgRef`. Publishes without
 ```jsonc
 // topic message
 { "type": "message", "topic": "...", "data": ..., "msgId": "...",
-  "requiresAck": true, "filter": "...", "isReplay": true }
+  "requiresAck": true, "filter": "...", "isReplay": true,
+  "from": "...", "fromType": "actor" | "server" }
 
 // publish ack (v2, only when the publish carried msgRef)
 { "type": "published", "topic": "...", "msgRef": "..." }
@@ -130,6 +131,77 @@ and every publish-path error frame echoes the `msgRef`. Publishes without
 | 42920 | `monthly_quota_exceeded` (control-plane block) |
 | 42930 | `message_too_large` (includes `maxSizeBytes`; payload measured as packed msgpack) |
 | 42940 | `unknown_topic` (v2 only; the room is not configured and could not be auto-provisioned — `hint` explains why). v1 clients receive `not_authorized` for the same condition |
+| 42960 | `invalid_filter` (a publish `filter`/`filters` value contains `/`, `#`, `+` or `\|`, is empty, or there are more than 100; `detail` says which) |
+
+## Message sender
+
+Every delivered message carries who sent it, stamped by the broker:
+`from` is the publisher's actorTokenId, or for a server publish
+(`POST /v1/publish`) the id of the API key used, and `fromType` is `"actor"`
+or `"server"`. The broker builds the envelope itself — the publisher's data
+always sits inside it — so a client cannot pose as the server or as another
+actor by putting `_from` in its payload. Replayed messages carry the stored
+sender. Brokers before 0.10 send neither field.
+
+## HTTP publish (server-side)
+
+A server holding a project API key publishes without a socket:
+
+```
+POST /v1/publish
+Authorization: Bearer <project API key>
+Content-Type: application/json
+
+{ "messages": [ { "appId": "...", "roomId": "...", "scopeId": "..." | null,
+                  "topic": "...", "data": ..., "filter": "..." | "filters": [...],
+                  "qos": 0 | 1 | 2 } ] }                                  // 1..100
+
+200 { "messages": [ { "id": "<msgId>" } ] }
+4xx/5xx { "error": { "code": C, "message": "...", "index": N } }
+```
+
+Each message names its target by id, so one key reaches every app, room and
+scope its project owns. The key is checked with the auth backend's
+`authorize_publish` per distinct target — key and ids only, never the
+message — and the answer is cached (allow 60s, deny 5s). The whole batch is
+authorized and validated before any of it is published; then it is
+published in order through the same pipeline as a WebSocket publish
+(envelope, size and quota checks, recording, presence wake). Server
+publishes never fire trigger webhooks.
+
+| Status | Code | Meaning |
+|--------|------|---------|
+| 400 | 40000 / 42960 | malformed body or message (`index`) / invalid filter |
+| 401 | 40100 | missing, unknown or unusable API key |
+| 403 | 40300 | the key may not publish |
+| 404 | 42940 | no such app/room/scope/topic in the key's project |
+| 413 | 41300 / 42930 | body over `publish_http_max_body_bytes` / message over the size ceiling |
+| 429 | 42910 / 42920 | per-key rate limit (`Retry-After`) / monthly quota |
+| 503 | 50300 | broker or control plane unavailable |
+
+## Trigger webhooks
+
+A trigger webhook fires (from the publishing node, asynchronously) for a
+WebSocket publish on a topic the app has a webhook for. When the app has
+signing secrets the call is signed and uses the v2 body:
+
+```
+NoLag-Signature: t=<unix seconds>,v1=<hex HMAC-SHA256(secret, "<t>.<raw body>")>[,v1=...]
+NoLag-Webhook-Id: <msgId>
+
+{ "id": "<msgId>", "type": "message.published", "createdAt": <ms>,
+  "projectId": "...", "appId": "...", "roomId": "...", "scopeId": "..." | null,
+  "topic": "...", "filter": "..." | null,
+  "sender": { "type": "actor", "id": "<actorTokenId>", "actorType": "..." },
+  "data": ... }
+```
+
+One `v1` per active secret, so receivers keep verifying through a rotation.
+`id` is the same on every retry. Apps without a secret keep the legacy body
+(`roomName`, `topicName`, `actorId`, `data`, `scope`). 5xx and connection
+errors are retried (`webhook_max_attempts`, backoff ~1s, ~4s); a 4xx is not.
+A final failure is reported to the control backend's DLQ as metadata only —
+ids, URL, status, error, attempts — never the message or the webhook headers.
 
 ## Topic resolution
 
@@ -230,9 +302,10 @@ it from a different, already-connected client on another node".
 
 `echo: false` publishes wrap the payload as
 `{ "data": ..., "_sender": "<connectionId>" }` on the broker; the sender's
-own connection drops it on delivery. With delivery tracking active, payloads
-carry `{ "_msgId": "...", "_data": ... }` envelopes that the server unwraps
-into `msgId`/`requiresAck` before forwarding.
+own connection drops it on delivery. Every payload is carried in a
+`{ "_data": ..., "_from": {...}, "_msgId": "..." }` envelope (`_msgId` only
+while recording) that the server unwraps into `data`, `from`/`fromType` and
+`msgId`/`requiresAck` before forwarding.
 
 ## MQTT ingress
 

@@ -1,5 +1,5 @@
 {
-  "_comment": "Static auth fixture for e2e/characterize-topics.mjs. tok-wild has only a wildcard rule (always resolves via fallback); tok-exact has an exact pattern with an internal topic mapping (resolves via UUID-style topic); tok-exact2 is a second exact-mapped actor for delivery checks.",
+  "_comment": "Static auth fixture for e2e/characterize-topics.mjs. tok-wild has only a wildcard rule (always resolves via fallback); tok-exact has an exact pattern with an internal topic mapping (resolves via UUID-style topic); tok-exact2 is a second exact-mapped actor for delivery checks. pub-a1/pub-a2 (scope land-a) and pub-b1 (scope land-b) plus apiKeys exercise POST /v1/publish, sender stamping and signed webhooks (e2e/publish.mjs); pub-a1 carries the webhook config.",
   "tokens": {
     "dev-token-alice": {
       "actorTokenId": "alice",
@@ -89,6 +89,158 @@
           "app_name": "charz"
         }
       ]
+    },
+    "tok-pub-a1": {
+      "actorTokenId": "pub-a1",
+      "projectId": "pub-project",
+      "organizationId": "pub-org",
+      "actorType": "user",
+      "appId": "app-chat",
+      "appName": "chat",
+      "scopeId": "scope-a",
+      "scopeSlug": "land-a",
+      "scopeName": "Land A",
+      "allowedTopics": [
+        {
+          "pattern": "chat/land-a/thread/messages",
+          "topic": "scope-a/room-thread/messages",
+          "permission": "pubSub",
+          "room_id": "room-thread",
+          "room_slug": "thread",
+          "app_id": "app-chat",
+          "app_name": "chat",
+          "scope_id": "scope-a",
+          "scope_slug": "land-a"
+        },
+        {
+          "pattern": "chat/land-a/thread/_typing",
+          "topic": "scope-a/room-thread/_typing",
+          "permission": "pubSub",
+          "room_id": "room-thread",
+          "room_slug": "thread",
+          "app_id": "app-chat",
+          "app_name": "chat",
+          "scope_id": "scope-a",
+          "scope_slug": "land-a"
+        }
+      ],
+      "topicWebhooks": {
+        "messages": {
+          "on_publish": {
+            "url": "http://host.docker.internal:18099/hook"
+          }
+        }
+      },
+      "webhookSigningSecrets": [
+        "whsec_e2e"
+      ]
+    },
+    "tok-pub-a2": {
+      "actorTokenId": "pub-a2",
+      "projectId": "pub-project",
+      "organizationId": "pub-org",
+      "actorType": "user",
+      "appId": "app-chat",
+      "appName": "chat",
+      "scopeId": "scope-a",
+      "scopeSlug": "land-a",
+      "scopeName": "Land A",
+      "allowedTopics": [
+        {
+          "pattern": "chat/land-a/thread/messages",
+          "topic": "scope-a/room-thread/messages",
+          "permission": "pubSub",
+          "room_id": "room-thread",
+          "room_slug": "thread",
+          "app_id": "app-chat",
+          "app_name": "chat",
+          "scope_id": "scope-a",
+          "scope_slug": "land-a"
+        },
+        {
+          "pattern": "chat/land-a/thread/_typing",
+          "topic": "scope-a/room-thread/_typing",
+          "permission": "pubSub",
+          "room_id": "room-thread",
+          "room_slug": "thread",
+          "app_id": "app-chat",
+          "app_name": "chat",
+          "scope_id": "scope-a",
+          "scope_slug": "land-a"
+        }
+      ]
+    },
+    "tok-pub-b1": {
+      "actorTokenId": "pub-b1",
+      "projectId": "pub-project",
+      "organizationId": "pub-org",
+      "actorType": "user",
+      "appId": "app-chat",
+      "appName": "chat",
+      "scopeId": "scope-b",
+      "scopeSlug": "land-b",
+      "scopeName": "Land B",
+      "allowedTopics": [
+        {
+          "pattern": "chat/land-b/thread/messages",
+          "topic": "scope-b/room-thread/messages",
+          "permission": "pubSub",
+          "room_id": "room-thread",
+          "room_slug": "thread",
+          "app_id": "app-chat",
+          "app_name": "chat",
+          "scope_id": "scope-b",
+          "scope_slug": "land-b"
+        },
+        {
+          "pattern": "chat/land-b/thread/_typing",
+          "topic": "scope-b/room-thread/_typing",
+          "permission": "pubSub",
+          "room_id": "room-thread",
+          "room_slug": "thread",
+          "app_id": "app-chat",
+          "app_name": "chat",
+          "scope_id": "scope-b",
+          "scope_slug": "land-b"
+        }
+      ]
+    }
+  },
+  "apiKeys": {
+    "nlg_live_e2e.secret": {
+      "apiKeyId": "key-e2e",
+      "projectId": "pub-project",
+      "organizationId": "pub-org",
+      "appSlug": "chat",
+      "grants": [
+        {
+          "appId": "app-chat",
+          "roomId": "room-thread",
+          "roomSlug": "thread",
+          "scopeId": "scope-a",
+          "scopeSlug": "land-a",
+          "topics": [
+            "messages"
+          ]
+        },
+        {
+          "appId": "app-chat",
+          "roomId": "room-thread",
+          "roomSlug": "thread",
+          "scopeId": "scope-b",
+          "scopeSlug": "land-b",
+          "topics": [
+            "messages"
+          ]
+        }
+      ]
+    },
+    "nlg_live_other.secret": {
+      "apiKeyId": "key-other",
+      "projectId": "other-project",
+      "organizationId": "other-org",
+      "appSlug": "chat",
+      "grants": []
     }
   }
 }

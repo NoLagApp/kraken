@@ -104,5 +104,7 @@ to_entry(Doc) ->
         topic => maps:get(topic, Doc, undefined),
         pattern => maps:get(pattern, Doc, undefined),
         payload => Data,
+        sender_actor_id => maps:get(sender_actor_id, Doc, undefined),
+        sender_type => maps:get(sender_type, Doc, undefined),
         timestamp => maps:get(timestamp, Doc, 0)
     }.

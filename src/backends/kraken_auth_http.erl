@@ -7,9 +7,17 @@
 %%   POST {auth_http_url}/validate          {"accessToken": "..."}
 %%   POST {auth_http_url}/revalidate        {"actorTokenId": "..."}
 %%   POST {auth_http_url}/check-room-access {"actorTokenId": "...", "pattern": "..."}
+%%   POST {auth_http_url}/authorize-publish {"apiKey": "...", "appId": "...",
+%%                                           "roomId": "...", "scopeId": "..." | null,
+%%                                           "topic": "..."}
 %%
 %% Validate response:
 %%   {"result": "allow" | "deny", "client_attrs": { ...auth attrs... }}
+%% Authorize-publish response (always 200; a deny is not an HTTP error):
+%%   {"allow": true, "api_key_id", "organization_id", "project_id", "app_id",
+%%    "room_id", "internal_topic", "pattern", "scope_id", "scope_slug",
+%%    "scope_name", "max_message_size_bytes"} |
+%%   {"allow": false, "reason": "invalid_api_key" | "not_found" | "forbidden"}
 %% Revalidate response:
 %%   {"valid": true, ...auth attrs...} |
 %%   {"valid": false, "error": "...", "disconnect_reason": "..."}
@@ -20,7 +28,7 @@
 -module(kraken_auth_http).
 -behaviour(kraken_auth).
 
--export([validate_token/1, revalidate_token/1, check_room_access/2]).
+-export([validate_token/1, revalidate_token/1, check_room_access/2, authorize_publish/2]).
 
 -define(POOL, kraken_auth_pool).
 -define(DEFAULT_CHECK_ROOM_TIMEOUT_MS, 2000).
@@ -94,6 +102,36 @@ check_room_access(ActorTokenId, Pattern) ->
             kraken_log:error("[AuthHttp] check-room-access request failed: ~p", [Reason]),
             {error, <<"connection_failed">>}
     end.
+
+%% May this project API key publish to this target? The key goes to the
+%% control plane, never the message: kraken asks about {key, app, room,
+%% scope, topic} and caches the answer (kraken_auth:authorize_publish/2).
+authorize_publish(ApiKey, Target) ->
+    Body = jsx:encode(#{
+        <<"apiKey">> => ApiKey,
+        <<"appId">> => maps:get(app_id, Target),
+        <<"roomId">> => maps:get(room_id, Target),
+        <<"scopeId">> => case maps:get(scope_id, Target, undefined) of
+            undefined -> null;
+            S -> S
+        end,
+        <<"topic">> => maps:get(topic, Target)
+    }),
+    case request(<<"/authorize-publish">>, Body, check_room_timeout()) of
+        {ok, 200, ResponseBody} ->
+            parse_publish_grant(jsx:decode(ResponseBody, [return_maps]));
+        {ok, StatusCode, _} ->
+            kraken_log:error("[AuthHttp] authorize-publish returned status ~p", [StatusCode]),
+            {error, unavailable};
+        {error, Reason} ->
+            kraken_log:error("[AuthHttp] authorize-publish request failed: ~p", [Reason]),
+            {error, unavailable}
+    end.
+
+parse_publish_grant(#{<<"allow">> := true} = R) ->
+    {ok, kraken_auth:publish_grant(R)};
+parse_publish_grant(R) ->
+    {error, {denied, maps:get(<<"reason">>, R, <<"forbidden">>)}}.
 
 %%====================================================================
 %% Internal

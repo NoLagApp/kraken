@@ -132,6 +132,8 @@ to_replay(MsgDoc) ->
         topic => maps:get(topic, MsgDoc, undefined),
         pattern => maps:get(pattern, MsgDoc, undefined),
         payload => Data,
+        sender_actor_id => maps:get(sender_actor_id, MsgDoc, undefined),
+        sender_type => maps:get(sender_type, MsgDoc, undefined),
         timestamp => maps:get(timestamp, MsgDoc, 0)
     }.
 

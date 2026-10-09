@@ -94,6 +94,7 @@ log_message(enabled, MessageId, Context, Topic, Pattern, SenderActorId, PackedPa
         topic_name => TopicName,
         pattern => Pattern,
         sender_actor_id => SenderActorId,
+        sender_type => maps:get(sender_type, Context, <<"actor">>),
         payload => iolist_to_binary(PackedPayload),
         payload_size => iolist_size(PackedPayload),
         timestamp => Timestamp

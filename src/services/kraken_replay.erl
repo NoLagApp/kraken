@@ -171,14 +171,26 @@ to_frame(DisplayTopic, Entry) ->
         undefined -> maps:get(topic, Entry, undefined);
         T -> T
     end,
-    #{
+    Frame = #{
         <<"type">> => <<"message">>,
         <<"topic">> => Topic,
         <<"data">> => maps:get(payload, Entry, #{}),
         <<"msgId">> => maps:get(message_id, Entry, undefined),
         <<"requiresAck">> => true,
         <<"isReplay">> => true
-    }.
+    },
+    %% The stored sender, so a replayed message says who sent it just as the
+    %% live delivery did. Messages stored before senders were typed are actors.
+    case maps:get(sender_actor_id, Entry, undefined) of
+        From when is_binary(From) ->
+            FromType = case maps:get(sender_type, Entry, undefined) of
+                Type when is_binary(Type) -> Type;
+                _ -> <<"actor">>
+            end,
+            Frame#{<<"from">> => From, <<"fromType">> => FromType};
+        _ ->
+            Frame
+    end.
 
 send(WsPid, Message) ->
     WsPid ! {send_to_client, Message}.

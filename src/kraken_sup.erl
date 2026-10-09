@@ -27,6 +27,10 @@ init([]) ->
     %% Own the ACL deny cache from this long-lived supervisor process so it
     %% can't be created (and later destroyed) by a transient connection.
     kraken_acl:ensure_deny_cache(),
+    kraken_auth:ensure_cache(),
+    kraken_auth:ensure_publish_cache(),
+    kraken_auth_static:ensure_file_cache(),
+    kraken_rate_limit:ensure_table(),
 
     Base = [
         worker(kraken_log, []),
@@ -35,7 +39,8 @@ init([]) ->
         worker(kraken_usage, []),
         worker(kraken_subscriptions, []),
         worker(kraken_resume, []),
-        worker(kraken_breaker, [])
+        worker(kraken_breaker, []),
+        kraken_publisher_pool:child_spec()
     ],
 
     AuthPool = http_pool(auth, auth_http_url, kraken_auth_pool),

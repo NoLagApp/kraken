@@ -73,6 +73,20 @@
         %% HTTP /internal/publish shared secret
         {internal_secret, "${INTERNAL_SECRET}"},
 
+        %% Trigger webhooks: attempts per call, per-attempt timeout, and the
+        %% backoff base (x4 per retry, +/-20% jitter: ~1s, ~4s). After the last
+        %% attempt the failure goes to the control plane's DLQ as metadata only.
+        %% Literals (not ${VAR}s) so a hot upgrade can add them safely.
+        {webhook_max_attempts, 3},
+        {webhook_timeout_ms, 30000},
+        {webhook_backoff_ms, 1000},
+
+        %% POST /v1/publish (project API keys): broker sessions kept open for
+        %% it, the largest request body, and messages per second per key.
+        {publisher_pool_size, 2},
+        {publish_http_max_body_bytes, 2097152},
+        {publish_http_rate_limit, 200},
+
         %% Clustering: standalone | dns | epmd | gossip
         %% kraken_cluster reads its settings (these and the rest in
         %% docs/CONFIG.md) from the OS environment, not from these entries.

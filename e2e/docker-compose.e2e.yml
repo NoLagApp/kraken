@@ -10,5 +10,11 @@ services:
       - "11884:1883" # MQTT ingress
     environment:
       - AUTH_ALLOW_ALL=${AUTH_ALLOW_ALL:-false}
+      # e2e/publish.mjs points these at its local receiver to capture DLQ reports.
+      - CONTROL_BACKEND=${CONTROL_BACKEND:-noop}
+      - CONTROL_HTTP_URL=${CONTROL_HTTP_URL:-}
+    # Lets kraken reach webhook/control receivers running on the host (Linux).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./auth.e2e.json:/app/examples/auth.json:ro

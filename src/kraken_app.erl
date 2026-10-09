@@ -36,6 +36,7 @@ start(_StartType, _StartArgs) ->
         {'_', [
             {"/ws", kraken_ws_handler, []},
             {"/health", kraken_health_handler, []},
+            {"/v1/publish", kraken_publish_http_handler, []},
             {"/internal/publish", kraken_internal_handler, []}
         ]}
     ]),

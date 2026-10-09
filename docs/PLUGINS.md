@@ -25,6 +25,11 @@ your wrapper app and set the config — no kraken changes needed.
     {ok, AuthData :: map()} | {error, Reason :: binary()}.
 -callback revalidate_token(ActorTokenId :: binary()) ->
     {ok, AuthData :: map()} | {error, Reason :: binary()} | {retry, Reason :: binary()}.
+%% optional
+-callback check_room_access(ActorTokenId :: binary(), Pattern :: binary()) ->
+    {ok, AllowedTopics :: list()} | {error, Reason :: binary()}.
+-callback authorize_publish(ApiKey :: binary(), Target :: map()) ->
+    {ok, Grant :: map()} | {error, {denied, Reason :: binary()} | unavailable}.
 ```
 
 `AuthData` (atom keys) — build it with `kraken_auth:build_auth_data/1` from a
@@ -33,10 +38,10 @@ binary-keyed attrs map:
 | Key | Meaning |
 |-----|---------|
 | `actor_token_id`, `organization_id`, `project_id`, `actor_type` | identity |
-| `apps` | list of app maps: `app_id`, `app_name`, `allowed_topics`, `active_subscriptions`, `allowed_lobbies`, `hydration_webhook`, `trigger_webhook` |
+| `apps` | list of app maps: `app_id`, `app_name`, `app_slug`, `allowed_topics`, `active_subscriptions`, `allowed_lobbies`, `hydration_webhook`, `trigger_webhook`, `topic_webhooks` (`{topic: {on_publish, on_subscribe}}`), `webhook_signing_secrets` (list; signs trigger calls when non-empty) |
 | `allowed_topics` | flattened ACL rules: `pattern` (MQTT-style, `+`/`#`), `topic` (internal broker topic), `permission` (`pubSub`/`publish`/`subscribe`), `room_id`, `room_slug` |
 | `max_connections`, `max_message_size_bytes` | limits (`unlimited` / bytes) |
-| `scope_slug` | multi-tenant scope injection (optional) |
+| `scope_slug`, `scope_id`, `scope_name` | multi-tenant scope injection; id and name go out in webhook payloads (optional) |
 | `persistent_session`, `session_expiry_seconds` | broker session hints |
 
 The dispatcher (`kraken_auth`) owns a 30s token cache; revalidation runs every
@@ -50,8 +55,23 @@ POST {AUTH_HTTP_URL}/validate     {"accessToken": "..."}
   -> {"result": "allow", "client_attrs": { ...attrs... }} | {"result": "deny"}
 POST {AUTH_HTTP_URL}/revalidate   {"actorTokenId": "..."}
   -> {"valid": true, ...attrs...} | {"valid": false, "disconnect_reason": "..."}
+POST {AUTH_HTTP_URL}/check-room-access {"actorTokenId": "...", "pattern": "..."}
+  -> {"allow": true, "allowed_topics": [...]} | {"allow": false}
+POST {AUTH_HTTP_URL}/authorize-publish {"apiKey": "...", "appId": "...", "roomId": "...",
+                                        "scopeId": "..." | null, "topic": "..."}
+  -> {"allow": true, "api_key_id", "organization_id", "project_id", "app_id", "room_id",
+      "internal_topic", "pattern", "scope_id", "scope_slug", "scope_name",
+      "max_message_size_bytes"}
+   | {"allow": false, "reason": "invalid_api_key" | "not_found" | "forbidden"}
 ```
 Authorization: `Bearer {BACKEND_SECRET}`.
+
+`authorize_publish` backs `POST /v1/publish` (see PROTOCOL.md). It receives
+the project API key and the target ids — never the message — and answers
+200 either way; a deny is not an HTTP error. `internal_topic` must be the
+broker topic subscribers of that room resolve to (`[scopeId/]roomId/topic`
+for NoLag's control plane). The dispatcher caches allows for 60s and denials
+for 5s; `{error, unavailable}` is never cached.
 
 ## kraken_broker — fan-out
 

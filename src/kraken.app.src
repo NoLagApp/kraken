@@ -1,6 +1,6 @@
 {application, kraken, [
     {description, "Kraken - pluggable realtime pub/sub proxy (auth, broker, store and control-plane backends)"},
-    {vsn, "0.9.1"},  %% MQTT ingress accepts connections; subscriptions restored on reconnect without a control plane; presence stays inside access scopes; gossip/dns cluster discovery work and the cookie is no longer logged
+    {vsn, "0.10.0"},  %% POST /v1/publish for project API keys through one shared publish pipeline; every message carries a broker-stamped sender (from/fromType); trigger webhooks signed (NoLag-Signature, v2 body) with metadata-only DLQ reports; auth cache keyed on SHA-256; scope id/name reach webhooks; builds on 0.9.1 (MQTT ingress, reconnect restore, scoped presence, cluster discovery)
     {registered, []},
     {mod, {kraken_app, []}},
     {applications, [
