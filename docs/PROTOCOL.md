@@ -32,7 +32,7 @@ treat an absent `protocolVersion` in the auth response as 1.
 // success
 { "type": "auth", "success": true, "actorTokenId": "...", "projectId": "...",
   "actorType": "...", "protocolVersion": 2,
-  "restoredSubscriptions": ["pattern", ...] }
+  "restoredSubscriptions": [...] }  // see "Reconnect restore"
 
 // failure
 { "type": "auth", "success": false, "error": "access_denied" | "connection_limit_reached" | "broker_unavailable" }
@@ -42,6 +42,13 @@ treat an absent `protocolVersion` in the auth response as 1.
 
 With `"reconnect": true`, kraken restores the connection's earlier
 subscriptions before replying, and lists them in `restoredSubscriptions`.
+Each entry is either a topic string or a map. Restores from kraken's own
+memory are the remembered subscribe requests:
+`{"topic": "...", "filters": [...], "qos": N, "loadBalance": bool,
+"loadBalanceGroup": "..."}`, with only the fields the client sent. Entries
+from an auth backend's `active_subscriptions` are passed through as the
+backend sent them (strings, or maps naming the topic `pattern` or `name`).
+Clients should read the topic from `topic`, `pattern` or `name`.
 The source is the auth backend's `active_subscriptions` when it returns any
 (a control plane that persists the subscription reports). Otherwise kraken
 uses its own memory of the subscribe requests made under the same key: the
