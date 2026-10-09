@@ -174,7 +174,7 @@ websocket_info({store_topic_mapping, MqttTopic, DisplayTopic}, State) ->
     {ok, State};
 
 %% Handle MQTT publish from emqtt msg_handler
-websocket_info({mqtt_publish, #{topic := MqttTopic, payload := Payload}},
+websocket_info({mqtt_publish, #{topic := MqttTopic, payload := Payload} = Delivery},
                #state{connection_id = ConnectionId, actor_token_id = ActorTokenId,
                       allowed_topics = AllowedForDisplay,
                       kraken_store = FirestoreWriter} = State) ->
@@ -200,7 +200,11 @@ websocket_info({mqtt_publish, #{topic := MqttTopic, payload := Payload}},
             DT
     end,
     %% Extract filter value from MQTT topic by comparing with base topic
-    FilterValue = extract_filter_from_mqtt_topic(MqttTopic, DisplayTopic),
+    %% The syn broker hands a wildcard subscriber its subscription pattern as
+    %% `topic` (base/#) and the concrete topic as `source_topic`; read the
+    %% filter from the concrete one, or every message would report "#".
+    FilterValue = extract_filter_from_mqtt_topic(
+        maps:get(source_topic, Delivery, MqttTopic), DisplayTopic),
     %% Decode the payload (it's msgpack encoded)
     case msgpack:unpack(Payload, [{unpack_str, as_binary}]) of
         {ok, Decoded} ->
@@ -1074,7 +1078,7 @@ handle_message(#{<<"type">> := <<"publish">>, <<"topic">> := Pattern, <<"data">>
             {reply, {binary, pack_msg(with_msg_ref(Response, Message))}, State1};
         {ok, State1} ->
             %% Check message size against the flat 900KB platform ceiling
-            PackedData = msgpack:pack(Data, [{pack_str, from_binary}]),
+            PackedData = kraken_msgpack:pack(Data),
             DataSize = iolist_size(PackedData),
             case DataSize > ?MAX_MESSAGE_SIZE of
                 true ->

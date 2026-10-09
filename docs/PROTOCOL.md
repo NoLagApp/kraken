@@ -174,9 +174,9 @@ the new deterministic name. Remove the shim once all nodes are upgraded.
 
 Subscribing with `filters` narrows delivery to matching publishes; each
 filter maps to an MQTT sub-topic of the base topic. Without filters a
-subscription is a wildcard over the base topic — **but wildcard
-subscriptions do not receive filtered publishes** (a filtered publish goes
-only to its sub-topic). Publishes carry either a single `filter` or a
+subscription is a wildcard over the base topic, so it receives every
+publish on the topic, filtered or not; the delivered message's `filter`
+carries the value the publish was sent with. Publishes carry either a single `filter` or a
 `filters` array, which is normalized into an AND-composite: lowercased,
 sorted, joined with `|`. Subscribe-side AND groups (nested arrays) normalize
 the same way. Filter values must not contain `/`, `#`, `+`, or `|`;
