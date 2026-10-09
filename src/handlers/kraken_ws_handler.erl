@@ -39,7 +39,8 @@
     kraken_store :: enabled | undefined,  %% Firestore writer status (centralized gen_server)
     presence :: map() | undefined,
     current_room_id :: binary() | undefined,  %% Room actor has presence in
-    subscribed_lobbies = [] :: list(),  %% Currently subscribed lobbies: [{Slug, [UUID]}]
+    presence_scope :: binary() | undefined,  %% Scope the room presence was joined under
+    subscribed_lobbies = [] :: list(),  %% Currently subscribed lobbies: [{Slug, [UUID], Scope}]
     lobby_slug_map = #{} :: map(),  %% slug => [LobbyUUID] built from allowed_lobbies
     %% Timestamp-based revalidation tracking
     last_validation_at :: erlang:timestamp() | undefined,
@@ -73,7 +74,9 @@
     scope_name :: binary() | undefined,
     %% Client-token (JWT) expiry in unix seconds. The connection is closed
     %% (4003) when this passes. undefined for opaque actor tokens.
-    auth_expires_at :: non_neg_integer() | undefined
+    auth_expires_at :: non_neg_integer() | undefined,
+    %% kraken_resume key ({ActorTokenId, ClientId}) for reconnect restore
+    resume_key :: term() | undefined
 }).
 
 %%====================================================================
@@ -171,7 +174,7 @@ websocket_info({store_topic_mapping, MqttTopic, DisplayTopic}, State) ->
     {ok, State};
 
 %% Handle MQTT publish from emqtt msg_handler
-websocket_info({mqtt_publish, #{topic := MqttTopic, payload := Payload}},
+websocket_info({mqtt_publish, #{topic := MqttTopic, payload := Payload} = Delivery},
                #state{connection_id = ConnectionId, actor_token_id = ActorTokenId,
                       allowed_topics = AllowedForDisplay,
                       kraken_store = FirestoreWriter} = State) ->
@@ -197,7 +200,11 @@ websocket_info({mqtt_publish, #{topic := MqttTopic, payload := Payload}},
             DT
     end,
     %% Extract filter value from MQTT topic by comparing with base topic
-    FilterValue = extract_filter_from_mqtt_topic(MqttTopic, DisplayTopic),
+    %% The syn broker hands a wildcard subscriber its subscription pattern as
+    %% `topic` (base/#) and the concrete topic as `source_topic`; read the
+    %% filter from the concrete one, or every message would report "#".
+    FilterValue = extract_filter_from_mqtt_topic(
+        maps:get(source_topic, Delivery, MqttTopic), DisplayTopic),
     %% Decode the payload (it's msgpack encoded)
     case msgpack:unpack(Payload, [{unpack_str, as_binary}]) of
         {ok, Decoded} ->
@@ -267,11 +274,13 @@ websocket_info({revalidation_success, AuthData}, State) ->
     NewState = apply_refreshed_auth(AuthData, State),
     OrgId = State#state.organization_id,
     NewMaxConn = NewState#state.max_connections,
-    %% Check if org is now over limit after plan downgrade
-    case check_connection_limit(OrgId, NewMaxConn) of
-        ok ->
+    %% Check if org is now over limit after plan downgrade. This connection
+    %% is already counted, so only a count ABOVE the limit is too many
+    %% (check_connection_limit/2 is for a connection that has not joined yet).
+    case over_connection_limit(OrgId, NewMaxConn) of
+        false ->
             {ok, NewState};
-        {error, limit_reached} ->
+        true ->
             kraken_log:info("[WS] Org ~s now over connection limit (~p) after revalidation - disconnecting~n",
                 [OrgId, NewMaxConn]),
             {reply, {close, 4002, <<"connection_limit_reached">>}, NewState}
@@ -352,6 +361,7 @@ websocket_info(_Info, State) ->
     {ok, State}.
 
 terminate(Reason, _Req, #state{mqtt_client = MqttClient, current_room_id = RoomId,
+                                presence_scope = PresenceScope,
                                 actor_token_id = ActorTokenId,
                                 organization_id = OrganizationId,
                                 project_id = ProjectId,
@@ -360,8 +370,14 @@ terminate(Reason, _Req, #state{mqtt_client = MqttClient, current_room_id = RoomI
                                 persistent_presence = PersistentPresence,
                                 persistent_session = PersistentSession,
                                 allowed_topics = AllowedTopics,
+                                resume_key = ResumeKey,
                                 kraken_store = FirestoreWriter} = _State) ->
     kraken_log:info("[WS] Connection closed~n", []),
+    %% Keep this key's subscriptions restorable for the retention window
+    case ResumeKey of
+        undefined -> ok;
+        _ -> catch kraken_resume:connection_closed(ResumeKey)
+    end,
 
     %% Log disconnection to Firestore (only if authenticated)
     case Authenticated of
@@ -388,7 +404,7 @@ terminate(Reason, _Req, #state{mqtt_client = MqttClient, current_room_id = RoomI
     case RoomId of
         undefined -> ok;
         _ ->
-            kraken_presence:leave_room_presence(RoomId, ActorTokenId),
+            kraken_presence:leave_room_presence(RoomId, PresenceScope, ActorTokenId),
             %% Persistent Presence: soft-offline the durable record (kept discoverable + wakeable)
             pp_offline(PersistentPresence, RoomId, ActorTokenId, AllowedTopics)
     end,
@@ -402,10 +418,10 @@ terminate(Reason, _Req, #state{mqtt_client = MqttClient, current_room_id = RoomI
     %% across the disconnect, so without this the broker keeps round-robining
     %% work to a member that is no longer here.
     kraken_lb:release_shared_subscriptions(MqttClient, PersistentSession),
-    %% Leave all subscribed lobbies (each entry is {Slug, [UUID]})
-    lists:foreach(fun({_Slug, UUIDs}) ->
+    %% Leave all subscribed lobbies (each entry is {Slug, [UUID], Scope})
+    lists:foreach(fun({_Slug, UUIDs, LobbyScope}) ->
         lists:foreach(fun(UUID) ->
-            kraken_presence:leave_lobby(UUID, ActorTokenId)
+            kraken_presence:leave_lobby(UUID, LobbyScope, ActorTokenId)
         end, UUIDs)
     end, SubscribedLobbies),
     %% Disconnect MQTT client
@@ -506,6 +522,16 @@ handle_message(#{<<"type">> := <<"auth">>, <<"token">> := Token} = Message, Stat
                 actor_token_id => ActorTokenIdForSyn
             }),
 
+            %% Reconnect restore memory (kraken_resume). A fresh connect drops
+            %% what an earlier, now-gone connection of this key left behind.
+            ResumeKey = kraken_resume:key(ActorTokenIdForSyn,
+                                          maps:get(<<"clientId">>, Message, undefined)),
+            case IsReconnect of
+                true -> ok;
+                false -> kraken_resume:fresh_connection(ResumeKey)
+            end,
+            kraken_resume:register_connection(ResumeKey),
+
             AllowedLobbies = maps:get(allowed_lobbies, AuthData, []),
             LobbySlugMap = build_lobby_slug_map(AllowedLobbies),
             MaxMsgSize = maps:get(max_message_size_bytes, AuthData, ?MAX_MESSAGE_SIZE),
@@ -533,7 +559,8 @@ handle_message(#{<<"type">> := <<"auth">>, <<"token">> := Token} = Message, Stat
                 scope_id = ScopeId,
                 scope_name = ScopeName,
                 protocol_version = NegotiatedVersion,
-                auth_expires_at = AuthExpiresAt
+                auth_expires_at = AuthExpiresAt,
+                resume_key = ResumeKey
             },
 
             %% Log connection success to Firestore
@@ -549,17 +576,27 @@ handle_message(#{<<"type">> := <<"auth">>, <<"token">> := Token} = Message, Stat
 
             %% Only restore subscriptions if this is a reconnect, not a fresh connect
             %% Fresh connects should start with no subscriptions - client will subscribe as needed
-            {RestoredSubscriptions, ResponseSubs} = case IsReconnect of
-                true ->
-                    ActiveSubscriptions = maps:get(active_subscriptions, AuthData, []),
-                    restore_subscriptions(MqttClient, ActiveSubscriptions, NewState, self()),
-                    {ActiveSubscriptions, ActiveSubscriptions};
-                false ->
-                    {[], []}
+            ActiveSubscriptions = case IsReconnect of
+                true -> maps:get(active_subscriptions, AuthData, []);
+                false -> []
             end,
+            restore_subscriptions(MqttClient, ActiveSubscriptions, NewState, self()),
 
             %% Collect pending filter state from restore_subscriptions
-            StateWithFilters = collect_pending_filters(NewState),
+            StateWithFilters0 = collect_pending_filters(NewState),
+
+            %% When the auth backend persists nothing (static auth, the
+            %% nolag-core example host), restore from kraken's own memory of
+            %% this key's subscribe requests, replayed through the normal
+            %% subscribe path so ACLs, scopes and filters apply as today.
+            {StateWithFilters, ResponseSubs} =
+                case IsReconnect andalso ActiveSubscriptions =:= [] of
+                    true ->
+                        replay_remembered_subscriptions(
+                            kraken_resume:take(ResumeKey), StateWithFilters0);
+                    false ->
+                        {StateWithFilters0, ActiveSubscriptions}
+                end,
 
             Response = #{
                 <<"type">> => <<"auth">>,
@@ -813,6 +850,7 @@ handle_message(#{<<"type">> := <<"subscribe">>, <<"topic">> := Pattern} = Messag
                             TrackMetadata
                     end,
                     kraken_subscriptions:track(ActorTokenId, Pattern, subscribe, TrackMetadata1),
+                    kraken_resume:remember(State#state.resume_key, Pattern, Message),
 
                     %% Call hydration webhook if configured (async)
                     %% Per-topic webhook takes precedence, fallback to app-level
@@ -911,6 +949,7 @@ handle_message(#{<<"type">> := <<"unsubscribe">>, <<"topic">> := Pattern},
     NewTopicFilters = maps:remove(Pattern, State#state.topic_filters),
     %% Persist unsubscription to Titus (async) - use pattern for tracking
     kraken_subscriptions:track(ActorTokenId, Pattern, unsubscribe),
+    kraken_resume:forget(State#state.resume_key, Pattern),
     Response = #{
         <<"type">> => <<"unsubscribed">>,
         <<"topic">> => Pattern
@@ -1010,6 +1049,7 @@ handle_message(#{<<"type">> := <<"setFilters">>, <<"topic">> := Pattern, <<"filt
                         _ -> #{filters => NewFilterList}
                     end,
                     kraken_subscriptions:track(ActorTokenId, Pattern, subscribe, TrackMetadata),
+                    kraken_resume:update_filters(State#state.resume_key, Pattern, NewFilterList),
 
                     Response = #{
                         <<"type">> => <<"filtersUpdated">>,
@@ -1040,7 +1080,7 @@ handle_message(#{<<"type">> := <<"publish">>, <<"topic">> := Pattern, <<"data">>
             {reply, {binary, pack_msg(with_msg_ref(Response, Message))}, State1};
         {ok, State1} ->
             %% Check message size against the flat 900KB platform ceiling
-            PackedData = msgpack:pack(Data, [{pack_str, from_binary}]),
+            PackedData = kraken_msgpack:pack(Data),
             DataSize = iolist_size(PackedData),
             case DataSize > ?MAX_MESSAGE_SIZE of
                 true ->
@@ -1212,14 +1252,23 @@ handle_message(#{<<"type">> := <<"presence">>, <<"roomId">> := RoomSlug, <<"data
             case OldRoomId of
                 undefined -> ok;
                 RoomId -> ok;  %% Same room, no need to leave
-                _ -> kraken_presence:leave_room_presence(OldRoomId, ActorTokenId)
+                _ -> kraken_presence:leave_room_presence(OldRoomId, State#state.presence_scope, ActorTokenId)
             end,
             %% Update presence in new room (using UUID)
-            kraken_presence:update_room_presence(RoomId, ActorTokenId, PresenceData, self(), ProjectId),
+            %% Presence is partitioned by access scope, like the topics are.
+            %% If the scope changed since this room was joined (revalidation),
+            %% leave the old scope's group first.
+            PresenceScope = State#state.scope_slug,
+            case OldRoomId =:= RoomId andalso State#state.presence_scope =/= PresenceScope of
+                true -> kraken_presence:leave_room_presence(RoomId, State#state.presence_scope, ActorTokenId);
+                false -> ok
+            end,
+            kraken_presence:update_room_presence(RoomId, PresenceScope, ActorTokenId, PresenceData, self(), ProjectId),
             %% Persistent Presence: write through a durable record when opted in
             Persistent = pp_write_through(RoomId, ActorTokenId, ProjectId,
                                           State#state.scope_id, PresenceData, AllowedTopics),
             NewState0 = State#state{presence = PresenceData, current_room_id = RoomId,
+                                    presence_scope = PresenceScope,
                                     persistent_presence = Persistent},
             %% A persistent-presence advertise is the actor declaring it's a
             %% durable, wakeable worker — start claim-based replay for any
@@ -1249,7 +1298,7 @@ handle_message(#{<<"type">> := <<"getPresence">>, <<"roomId">> := RoomSlug},
         undefined -> RoomSlug;  %% Fallback to slug if not found
         Uuid -> Uuid
     end,
-    LivePresenceList = kraken_presence:get_room_presence(ResolvedRoomId),
+    LivePresenceList = kraken_presence:get_room_presence(ResolvedRoomId, State#state.scope_slug),
     %% Persistent Presence: merge offline-but-registered actors into discovery
     PresenceList = pp_merge_room_presence(LivePresenceList, ResolvedRoomId, AllowedTopics),
     Response = #{
@@ -1282,7 +1331,7 @@ handle_message(#{<<"type">> := <<"lobbySubscribe">>, <<"lobbyId">> := LobbySlug}
             %% Resolve slug to UUIDs and join all syn groups
             LobbyUUIDs = maps:get(LobbySlug, LobbySlugMap, []),
             lists:foreach(fun(UUID) ->
-                kraken_presence:join_lobby(UUID, ActorTokenId, self())
+                kraken_presence:join_lobby(UUID, State#state.scope_slug, ActorTokenId, self())
             end, LobbyUUIDs),
             %% Warm lobby cache from token's allowed_topics so that
             %% get_rooms_for_lobby and get_lobbies_for_room resolve correctly
@@ -1308,7 +1357,7 @@ handle_message(#{<<"type">> := <<"lobbySubscribe">>, <<"lobbyId">> := LobbySlug}
             %% get_lobby_presence returns a map #{RoomId => #{ActorId => Data}}
             %% Merge maps from multiple lobby UUIDs (same room can appear in multiple)
             RawPresence = lists:foldl(fun(UUID, Acc) ->
-                maps:merge(Acc, kraken_presence:get_lobby_presence(UUID))
+                maps:merge(Acc, kraken_presence:get_lobby_presence(UUID, State#state.scope_slug))
             end, #{}, LobbyUUIDs),
             %% Convert room UUIDs to slugs so the client SDK can match its room map
             LobbyPresence = convert_presence_room_ids_to_slugs(RawPresence, AllowedTopics),
@@ -1318,8 +1367,8 @@ handle_message(#{<<"type">> := <<"lobbySubscribe">>, <<"lobbyId">> := LobbySlug}
                 <<"lobbyId">> => LobbySlug,
                 <<"presence">> => LobbyPresence
             },
-            %% Store {Slug, [UUIDs]} in subscribed_lobbies, replacing any existing entry for this slug
-            NewSubscribedLobbies = [{LobbySlug, LobbyUUIDs} |
+            %% Store {Slug, [UUIDs], Scope} in subscribed_lobbies, replacing any existing entry for this slug
+            NewSubscribedLobbies = [{LobbySlug, LobbyUUIDs, State#state.scope_slug} |
                 lists:keydelete(LobbySlug, 1, SubscribedLobbies)],
             NewState = State#state{subscribed_lobbies = NewSubscribedLobbies},
             {reply, {binary, pack_msg(Response)}, NewState};
@@ -1338,9 +1387,9 @@ handle_message(#{<<"type">> := <<"lobbyUnsubscribe">>, <<"lobbyId">> := LobbySlu
                       subscribed_lobbies = SubscribedLobbies} = State) ->
     %% Find the {Slug, [UUIDs]} tuple and leave all UUID syn groups
     case lists:keyfind(LobbySlug, 1, SubscribedLobbies) of
-        {LobbySlug, UUIDs} ->
+        {LobbySlug, UUIDs, LobbyScope} ->
             lists:foreach(fun(UUID) ->
-                kraken_presence:leave_lobby(UUID, ActorTokenId)
+                kraken_presence:leave_lobby(UUID, LobbyScope, ActorTokenId)
             end, UUIDs);
         false ->
             ok
@@ -1363,7 +1412,7 @@ handle_message(#{<<"type">> := <<"getLobbyPresence">>, <<"lobbyId">> := LobbySlu
             %% Resolve slug to UUIDs and aggregate presence
             LobbyUUIDs = maps:get(LobbySlug, LobbySlugMap, []),
             RawPresence = lists:foldl(fun(UUID, Acc) ->
-                maps:merge(Acc, kraken_presence:get_lobby_presence(UUID))
+                maps:merge(Acc, kraken_presence:get_lobby_presence(UUID, State#state.scope_slug))
             end, #{}, LobbyUUIDs),
             LobbyPresence = convert_presence_room_ids_to_slugs(RawPresence, AllowedTopics),
             Response = #{
@@ -1415,6 +1464,32 @@ handle_message(Message, State) ->
 %%====================================================================
 %% Internal functions
 %%====================================================================
+
+%% Replay subscribe requests remembered by kraken_resume (on reconnect),
+%% through the normal subscribe handler so ACLs, scope injection, filters
+%% and load balancing behave exactly as for a live subscribe. A request the
+%% actor may no longer make is dropped (and so not remembered again).
+%% Returns the resulting state and the requests that were restored.
+replay_remembered_subscriptions(Requests, State) ->
+    {FinalState, Restored} = lists:foldl(fun(Request, {AccState, AccRestored}) ->
+        Topic = maps:get(<<"topic">>, Request),
+        Result = (catch handle_message(Request#{<<"type">> => <<"subscribe">>}, AccState)),
+        NextState = case Result of
+            {reply, _Frames, S} when is_record(S, state) -> S;
+            {ok, S} when is_record(S, state) -> S;
+            _ -> AccState
+        end,
+        case get({mqtt_topics_for, Topic}) of
+            undefined -> {NextState, AccRestored};
+            _ -> {NextState, [Request | AccRestored]}
+        end
+    end, {State, []}, Requests),
+    case Restored of
+        [] -> ok;
+        _ -> kraken_log:info("[WS] Restored ~p subscription(s) for ~s from kraken_resume",
+                             [length(Restored), State#state.actor_token_id])
+    end,
+    {FinalState, lists:reverse(Restored)}.
 
 %% Restore subscriptions from Titus (on reconnect)
 %% Subscriptions can be simple topic names (strings) or maps with load balance info
@@ -1703,6 +1778,12 @@ binary_to_hex(Bin) ->
 
 %% Check per-organization connection limit via syn
 %% Returns ok if under limit, {error, limit_reached} if over
+%% For a connection that is already counted (revalidation).
+over_connection_limit(_OrgId, unlimited) -> false;
+over_connection_limit(undefined, _MaxConn) -> false;
+over_connection_limit(OrgId, MaxConn) ->
+    length(syn:members(kraken_connections, {org, OrgId})) > MaxConn.
+
 check_connection_limit(_OrgId, unlimited) -> ok;
 check_connection_limit(undefined, _MaxConn) -> ok;
 check_connection_limit(OrgId, MaxConn) ->
@@ -1734,9 +1815,11 @@ check_rate_limit(State) ->
             {ok, State#state{msg_count = 1, rate_limit_second = CurrentSecond}}
     end.
 
-%% Pack message with binary keys as strings for JS compatibility
+%% Pack message with binary keys as strings for JS compatibility. Data that
+%% is not valid UTF-8 (an MQTT client's binary payload, say) is packed as
+%% MessagePack bin instead of failing (kraken_msgpack).
 pack_msg(Map) ->
-    iolist_to_binary(msgpack:pack(Map, [{pack_str, from_binary}])).
+    iolist_to_binary(kraken_msgpack:pack(Map)).
 
 %% Async revalidation - called in spawned process
 %% Sends result back to WebSocket handler process

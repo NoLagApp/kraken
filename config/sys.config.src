@@ -74,6 +74,8 @@
         {internal_secret, "${INTERNAL_SECRET}"},
 
         %% Clustering: standalone | dns | epmd | gossip
+        %% kraken_cluster reads its settings (these and the rest in
+        %% docs/CONFIG.md) from the OS environment, not from these entries.
         {cluster_strategy, ${CLUSTER_STRATEGY}},
         {cluster_dns_name, "${CLUSTER_DNS_NAME}"},
         {cluster_hosts, "${CLUSTER_HOSTS}"},

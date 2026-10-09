@@ -32,11 +32,42 @@ treat an absent `protocolVersion` in the auth response as 1.
 // success
 { "type": "auth", "success": true, "actorTokenId": "...", "projectId": "...",
   "actorType": "...", "protocolVersion": 2,
-  "restoredSubscriptions": ["pattern", ...] }
+  "restoredSubscriptions": [...] }  // see "Reconnect restore"
 
 // failure
 { "type": "auth", "success": false, "error": "access_denied" | "connection_limit_reached" | "broker_unavailable" }
 ```
+
+### Reconnect restore
+
+With `"reconnect": true`, kraken restores the connection's earlier
+subscriptions before replying, and lists them in `restoredSubscriptions`.
+Each entry is either a topic string or a map. Restores from kraken's own
+memory are the remembered subscribe requests:
+`{"topic": "...", "filters": [...], "qos": N, "loadBalance": bool,
+"loadBalanceGroup": "..."}`, with only the fields the client sent. Entries
+from an auth backend's `active_subscriptions` are passed through as the
+backend sent them (strings, or maps naming the topic `pattern` or `name`).
+Clients should read the topic from `topic`, `pattern` or `name`.
+The source is the auth backend's `active_subscriptions` when it returns any
+(a control plane that persists the subscription reports). Otherwise kraken
+uses its own memory of the subscribe requests made under the same key: the
+actor token plus the optional `clientId` from the auth message. Those
+requests are replayed through the normal subscribe path, so current ACLs,
+scopes, filters (including `setFilters` changes) and load balancing apply;
+a topic the actor may no longer subscribe to is dropped.
+
+- Without a `clientId`, all connections of one actor share a key, so a
+  reconnect restores the union of their subscriptions. Send a `clientId` per
+  client instance to keep them apart.
+- A connect without `"reconnect": true` starts empty and drops what an
+  earlier, now-closed connection of the same key left behind.
+- The memory is held in RAM, cluster-wide: a reconnect that lands on another
+  node still finds it. It is kept while any connection holds the key and for
+  `resume_retention_ms` (default 3600000) after the last one closes. It does
+  not survive a restart of the node that held it: after a kraken restart,
+  clients must subscribe again (subscribing in the SDK's `connect` handler
+  covers both cases, and a repeated subscribe is harmless).
 
 ## Client → server messages
 
@@ -150,9 +181,9 @@ the new deterministic name. Remove the shim once all nodes are upgraded.
 
 Subscribing with `filters` narrows delivery to matching publishes; each
 filter maps to an MQTT sub-topic of the base topic. Without filters a
-subscription is a wildcard over the base topic — **but wildcard
-subscriptions do not receive filtered publishes** (a filtered publish goes
-only to its sub-topic). Publishes carry either a single `filter` or a
+subscription is a wildcard over the base topic, so it receives every
+publish on the topic, filtered or not; the delivered message's `filter`
+carries the value the publish was sent with. Publishes carry either a single `filter` or a
 `filters` array, which is normalized into an AND-composite: lowercased,
 sorted, joined with `|`. Subscribe-side AND groups (nested arrays) normalize
 the same way. Filter values must not contain `/`, `#`, `+`, or `|`;
@@ -182,6 +213,10 @@ the scope slug injected after the app segment (`app/scope/room/topic`); the
 internal topic is prefixed with the scope id. ACL rules are enumerated per
 scope by the control plane.
 
+Room presence and lobby presence are partitioned the same way: actors in
+different scopes (or a scoped and an unscoped actor) never see each other's
+presence, even when their grants point at the same room id.
+
 ## Subscription freshness
 
 Connection auth state (allowed_topics) is cached ~30s and revalidated
@@ -201,12 +236,76 @@ into `msgId`/`requiresAck` before forwarding.
 
 ## MQTT ingress
 
-Devices can connect over MQTT 3.1.1 (default port 1883): CONNECT
-username/password = anything/`<access token>` flows through the same auth
-backend, topics map to ACL patterns via the same unified resolution, QoS 0-2
-supported. Caveats: MQTT 3.1.1 cannot NACK a publish — denied publishes are
-dropped with a broker-side log (and acked at QoS>0 to prevent retry storms);
-subscribe failures surface as SUBACK failure return codes.
+Devices can connect over MQTT 3.1.1 (default port 1883). The CONNECT
+password is the access token (the username can be anything; with no
+password the username is used as the token), validated by the same auth
+backend as a WebSocket `auth`. An unknown token gets CONNACK return code 5
+(not authorized). MQTT 5 clients are not supported: the connection is closed
+without a CONNACK.
+
+### Topics
+
+An MQTT topic is the same pattern a WebSocket client uses (`app/room/topic`)
+and resolves through the same unified resolution, so MQTT and WebSocket
+clients on one pattern exchange messages. A delivery carries the topic the
+client subscribed with, never the internal topic.
+
+- A filter outside the actor's grants gets a SUBACK failure (`0x80`).
+- Wildcard filters (`+`, `#`) work under wildcard grants: `demo/general/#`
+  receives everything published below `demo/general/`, and each delivery
+  carries the concrete topic it was published on. A topic that resolves
+  through an exact rule with an internal mapping (a control-plane room) is
+  delivered only to subscriptions on that exact topic, not to wildcard
+  filters that would match it.
+- A WebSocket publish with a `filter` goes to `<topic>/<filter>`. MQTT
+  filters that match that level receive it (`demo/general/#` gets it as
+  `demo/general/chat/vip`); a subscription on `<topic>` itself does not.
+- UNSUBSCRIBE leaves exactly the broker topic its SUBSCRIBE joined, and
+  nothing more is delivered for that filter after the UNSUBACK.
+
+### Payloads
+
+MQTT payloads are opaque bytes, while WebSocket `data` is any MessagePack
+value. Between the two:
+
+- **MQTT publish:** the payload bytes are published as one binary.
+  WebSocket subscribers receive it as `data`: a string when the bytes are
+  valid UTF-8 (a JSON payload arrives as the JSON text, not parsed), binary
+  data otherwise (`Uint8Array` in the JS SDK). Messages published over MQTT
+  carry no `msgId`, so they are not delivery-tracked.
+- **Delivery to an MQTT subscriber:** when the message data is a string or
+  binary, the PUBLISH payload is exactly those bytes. Any other value (an
+  object, array or number, for example) is sent as its MessagePack
+  encoding. The echo-suppression and delivery-tracking envelopes are
+  removed first.
+- **No echo:** an MQTT client never receives its own publishes, even on a
+  topic it is subscribed to.
+
+### QoS and retain
+
+- PUBLISH at QoS 0, 1 and 2 is accepted: QoS 1 gets PUBACK, QoS 2 gets
+  PUBREC and, after PUBREL, PUBCOMP.
+- Deliveries to MQTT subscribers are QoS 0, and SUBACK grants QoS 0
+  whatever QoS was requested.
+- The retain flag on an MQTT PUBLISH is not applied. Retained messages
+  from WebSocket publishers (`retain: true`) are delivered to an MQTT
+  client when it subscribes.
+
+### Limits
+
+MQTT 3.1.1 cannot NACK a publish, so each of these is dropped with a
+broker log line and still acknowledged at QoS 1 and 2, which keeps clients
+from retrying it forever:
+
+- a publish without a publish grant for its topic;
+- a payload over 921600 bytes (the same 900KB ceiling as WebSocket, measured
+  on the raw payload);
+- publishes over the per-connection rate limit of 50 msg/s (one log line per
+  second while the limit applies).
+
+A packet over 1 MiB (1048576 bytes, the WebSocket frame cap) closes the
+connection. So does 1.5x the CONNECT keep-alive without any packet from the
+client; every packet resets that timer, not only PINGREQ.
 
 ## Persistent presence
 

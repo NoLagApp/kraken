@@ -11,7 +11,9 @@
 %%    publish time
 %%  - shared subscriptions ($share/Group/Topic) deliver to ONE member
 %%  - retained messages stored in ETS with TTL, replayed on subscribe
-%%  - subscribers receive {mqtt_publish, #{topic := T, payload := P}}
+%%  - subscribers receive {mqtt_publish, #{topic := T, payload := P}};
+%%    a wildcard subscriber gets T = its subscription pattern, plus
+%%    source_topic := the topic the message was published on
 %% @end
 %%%-------------------------------------------------------------------
 -module(kraken_broker_syn).
@@ -108,11 +110,13 @@ capabilities() ->
 %% Internal
 %%====================================================================
 
+%% kraken_msgpack so opaque (non-UTF-8) binaries, e.g. MQTT payloads, encode
+%% as MessagePack bin instead of crashing the publisher
 encode(Data, undefined) ->
-    msgpack:pack(Data, [{pack_str, from_binary}]);
+    kraken_msgpack:pack(Data);
 encode(Data, Sender) ->
     Envelope = #{<<"data">> => Data, <<"_sender">> => Sender},
-    msgpack:pack(Envelope, [{pack_str, from_binary}]).
+    kraken_msgpack:pack(Envelope).
 
 fanout(Topic, Payload) ->
     Msg = {mqtt_publish, #{topic => Topic, payload => Payload}},
@@ -125,7 +129,8 @@ fanout(Topic, Payload) ->
         fun({topic, Sub} = _G) when Sub =/= Topic ->
                 case has_wildcard(Sub) andalso topic_matches(Topic, Sub) of
                     true ->
-                        SubMsg = {mqtt_publish, #{topic => Sub, payload => Payload}},
+                        SubMsg = {mqtt_publish, #{topic => Sub, source_topic => Topic,
+                                                  payload => Payload}},
                         [P ! SubMsg || {P, _} <- syn:members(?SCOPE, {topic, Sub})];
                     false ->
                         ok

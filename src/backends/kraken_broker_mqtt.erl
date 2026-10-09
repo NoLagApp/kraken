@@ -207,8 +207,9 @@ publish(Client, Topic, Data, Sender, QoS, Retain) ->
     publish_internal(Client, Topic, Data, Sender, QoS, Retain).
 
 publish_internal(Client, Topic, Data, undefined, QoS, Retain) ->
-    %% Encode data as MessagePack (with binary as string for JS compatibility)
-    Payload = msgpack:pack(Data, [{pack_str, from_binary}]),
+    %% Encode data as MessagePack (with binary as string for JS compatibility;
+    %% a binary that is not valid UTF-8 encodes as bin, see kraken_msgpack)
+    Payload = kraken_msgpack:pack(Data),
     %% emqtt:publish/4 accepts [pubopt()] as 4th arg: [{qos, N}, {retain, Bool}]
     Opts = [{qos, QoS}] ++ case Retain of true -> [{retain, true}]; _ -> [] end,
     emqtt:publish(Client, Topic, Payload, Opts),
@@ -216,7 +217,7 @@ publish_internal(Client, Topic, Data, undefined, QoS, Retain) ->
 publish_internal(Client, Topic, Data, Sender, QoS, Retain) ->
     %% Wraps data in envelope: #{data => Data, _sender => Sender}
     Envelope = #{<<"data">> => Data, <<"_sender">> => Sender},
-    Payload = msgpack:pack(Envelope, [{pack_str, from_binary}]),
+    Payload = kraken_msgpack:pack(Envelope),
     Opts = [{qos, QoS}] ++ case Retain of true -> [{retain, true}]; _ -> [] end,
     emqtt:publish(Client, Topic, Payload, Opts),
     ok.
