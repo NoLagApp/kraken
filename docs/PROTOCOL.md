@@ -206,6 +206,10 @@ the scope slug injected after the app segment (`app/scope/room/topic`); the
 internal topic is prefixed with the scope id. ACL rules are enumerated per
 scope by the control plane.
 
+Room presence and lobby presence are partitioned the same way: actors in
+different scopes (or a scoped and an unscoped actor) never see each other's
+presence, even when their grants point at the same room id.
+
 ## Subscription freshness
 
 Connection auth state (allowed_topics) is cached ~30s and revalidated

@@ -39,7 +39,8 @@
     kraken_store :: enabled | undefined,  %% Firestore writer status (centralized gen_server)
     presence :: map() | undefined,
     current_room_id :: binary() | undefined,  %% Room actor has presence in
-    subscribed_lobbies = [] :: list(),  %% Currently subscribed lobbies: [{Slug, [UUID]}]
+    presence_scope :: binary() | undefined,  %% Scope the room presence was joined under
+    subscribed_lobbies = [] :: list(),  %% Currently subscribed lobbies: [{Slug, [UUID], Scope}]
     lobby_slug_map = #{} :: map(),  %% slug => [LobbyUUID] built from allowed_lobbies
     %% Timestamp-based revalidation tracking
     last_validation_at :: erlang:timestamp() | undefined,
@@ -354,6 +355,7 @@ websocket_info(_Info, State) ->
     {ok, State}.
 
 terminate(Reason, _Req, #state{mqtt_client = MqttClient, current_room_id = RoomId,
+                                presence_scope = PresenceScope,
                                 actor_token_id = ActorTokenId,
                                 organization_id = OrganizationId,
                                 project_id = ProjectId,
@@ -396,7 +398,7 @@ terminate(Reason, _Req, #state{mqtt_client = MqttClient, current_room_id = RoomI
     case RoomId of
         undefined -> ok;
         _ ->
-            kraken_presence:leave_room_presence(RoomId, ActorTokenId),
+            kraken_presence:leave_room_presence(RoomId, PresenceScope, ActorTokenId),
             %% Persistent Presence: soft-offline the durable record (kept discoverable + wakeable)
             pp_offline(PersistentPresence, RoomId, ActorTokenId, AllowedTopics)
     end,
@@ -410,10 +412,10 @@ terminate(Reason, _Req, #state{mqtt_client = MqttClient, current_room_id = RoomI
     %% across the disconnect, so without this the broker keeps round-robining
     %% work to a member that is no longer here.
     kraken_lb:release_shared_subscriptions(MqttClient, PersistentSession),
-    %% Leave all subscribed lobbies (each entry is {Slug, [UUID]})
-    lists:foreach(fun({_Slug, UUIDs}) ->
+    %% Leave all subscribed lobbies (each entry is {Slug, [UUID], Scope})
+    lists:foreach(fun({_Slug, UUIDs, LobbyScope}) ->
         lists:foreach(fun(UUID) ->
-            kraken_presence:leave_lobby(UUID, ActorTokenId)
+            kraken_presence:leave_lobby(UUID, LobbyScope, ActorTokenId)
         end, UUIDs)
     end, SubscribedLobbies),
     %% Disconnect MQTT client
@@ -1244,14 +1246,23 @@ handle_message(#{<<"type">> := <<"presence">>, <<"roomId">> := RoomSlug, <<"data
             case OldRoomId of
                 undefined -> ok;
                 RoomId -> ok;  %% Same room, no need to leave
-                _ -> kraken_presence:leave_room_presence(OldRoomId, ActorTokenId)
+                _ -> kraken_presence:leave_room_presence(OldRoomId, State#state.presence_scope, ActorTokenId)
             end,
             %% Update presence in new room (using UUID)
-            kraken_presence:update_room_presence(RoomId, ActorTokenId, PresenceData, self(), ProjectId),
+            %% Presence is partitioned by access scope, like the topics are.
+            %% If the scope changed since this room was joined (revalidation),
+            %% leave the old scope's group first.
+            PresenceScope = State#state.scope_slug,
+            case OldRoomId =:= RoomId andalso State#state.presence_scope =/= PresenceScope of
+                true -> kraken_presence:leave_room_presence(RoomId, State#state.presence_scope, ActorTokenId);
+                false -> ok
+            end,
+            kraken_presence:update_room_presence(RoomId, PresenceScope, ActorTokenId, PresenceData, self(), ProjectId),
             %% Persistent Presence: write through a durable record when opted in
             Persistent = pp_write_through(RoomId, ActorTokenId, ProjectId,
                                           State#state.scope_id, PresenceData, AllowedTopics),
             NewState0 = State#state{presence = PresenceData, current_room_id = RoomId,
+                                    presence_scope = PresenceScope,
                                     persistent_presence = Persistent},
             %% A persistent-presence advertise is the actor declaring it's a
             %% durable, wakeable worker — start claim-based replay for any
@@ -1281,7 +1292,7 @@ handle_message(#{<<"type">> := <<"getPresence">>, <<"roomId">> := RoomSlug},
         undefined -> RoomSlug;  %% Fallback to slug if not found
         Uuid -> Uuid
     end,
-    LivePresenceList = kraken_presence:get_room_presence(ResolvedRoomId),
+    LivePresenceList = kraken_presence:get_room_presence(ResolvedRoomId, State#state.scope_slug),
     %% Persistent Presence: merge offline-but-registered actors into discovery
     PresenceList = pp_merge_room_presence(LivePresenceList, ResolvedRoomId, AllowedTopics),
     Response = #{
@@ -1314,7 +1325,7 @@ handle_message(#{<<"type">> := <<"lobbySubscribe">>, <<"lobbyId">> := LobbySlug}
             %% Resolve slug to UUIDs and join all syn groups
             LobbyUUIDs = maps:get(LobbySlug, LobbySlugMap, []),
             lists:foreach(fun(UUID) ->
-                kraken_presence:join_lobby(UUID, ActorTokenId, self())
+                kraken_presence:join_lobby(UUID, State#state.scope_slug, ActorTokenId, self())
             end, LobbyUUIDs),
             %% Warm lobby cache from token's allowed_topics so that
             %% get_rooms_for_lobby and get_lobbies_for_room resolve correctly
@@ -1340,7 +1351,7 @@ handle_message(#{<<"type">> := <<"lobbySubscribe">>, <<"lobbyId">> := LobbySlug}
             %% get_lobby_presence returns a map #{RoomId => #{ActorId => Data}}
             %% Merge maps from multiple lobby UUIDs (same room can appear in multiple)
             RawPresence = lists:foldl(fun(UUID, Acc) ->
-                maps:merge(Acc, kraken_presence:get_lobby_presence(UUID))
+                maps:merge(Acc, kraken_presence:get_lobby_presence(UUID, State#state.scope_slug))
             end, #{}, LobbyUUIDs),
             %% Convert room UUIDs to slugs so the client SDK can match its room map
             LobbyPresence = convert_presence_room_ids_to_slugs(RawPresence, AllowedTopics),
@@ -1350,8 +1361,8 @@ handle_message(#{<<"type">> := <<"lobbySubscribe">>, <<"lobbyId">> := LobbySlug}
                 <<"lobbyId">> => LobbySlug,
                 <<"presence">> => LobbyPresence
             },
-            %% Store {Slug, [UUIDs]} in subscribed_lobbies, replacing any existing entry for this slug
-            NewSubscribedLobbies = [{LobbySlug, LobbyUUIDs} |
+            %% Store {Slug, [UUIDs], Scope} in subscribed_lobbies, replacing any existing entry for this slug
+            NewSubscribedLobbies = [{LobbySlug, LobbyUUIDs, State#state.scope_slug} |
                 lists:keydelete(LobbySlug, 1, SubscribedLobbies)],
             NewState = State#state{subscribed_lobbies = NewSubscribedLobbies},
             {reply, {binary, pack_msg(Response)}, NewState};
@@ -1370,9 +1381,9 @@ handle_message(#{<<"type">> := <<"lobbyUnsubscribe">>, <<"lobbyId">> := LobbySlu
                       subscribed_lobbies = SubscribedLobbies} = State) ->
     %% Find the {Slug, [UUIDs]} tuple and leave all UUID syn groups
     case lists:keyfind(LobbySlug, 1, SubscribedLobbies) of
-        {LobbySlug, UUIDs} ->
+        {LobbySlug, UUIDs, LobbyScope} ->
             lists:foreach(fun(UUID) ->
-                kraken_presence:leave_lobby(UUID, ActorTokenId)
+                kraken_presence:leave_lobby(UUID, LobbyScope, ActorTokenId)
             end, UUIDs);
         false ->
             ok
@@ -1395,7 +1406,7 @@ handle_message(#{<<"type">> := <<"getLobbyPresence">>, <<"lobbyId">> := LobbySlu
             %% Resolve slug to UUIDs and aggregate presence
             LobbyUUIDs = maps:get(LobbySlug, LobbySlugMap, []),
             RawPresence = lists:foldl(fun(UUID, Acc) ->
-                maps:merge(Acc, kraken_presence:get_lobby_presence(UUID))
+                maps:merge(Acc, kraken_presence:get_lobby_presence(UUID, State#state.scope_slug))
             end, #{}, LobbyUUIDs),
             LobbyPresence = convert_presence_room_ids_to_slugs(RawPresence, AllowedTopics),
             Response = #{
