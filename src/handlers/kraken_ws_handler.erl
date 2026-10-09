@@ -274,11 +274,13 @@ websocket_info({revalidation_success, AuthData}, State) ->
     NewState = apply_refreshed_auth(AuthData, State),
     OrgId = State#state.organization_id,
     NewMaxConn = NewState#state.max_connections,
-    %% Check if org is now over limit after plan downgrade
-    case check_connection_limit(OrgId, NewMaxConn) of
-        ok ->
+    %% Check if org is now over limit after plan downgrade. This connection
+    %% is already counted, so only a count ABOVE the limit is too many
+    %% (check_connection_limit/2 is for a connection that has not joined yet).
+    case over_connection_limit(OrgId, NewMaxConn) of
+        false ->
             {ok, NewState};
-        {error, limit_reached} ->
+        true ->
             kraken_log:info("[WS] Org ~s now over connection limit (~p) after revalidation - disconnecting~n",
                 [OrgId, NewMaxConn]),
             {reply, {close, 4002, <<"connection_limit_reached">>}, NewState}
@@ -1776,6 +1778,12 @@ binary_to_hex(Bin) ->
 
 %% Check per-organization connection limit via syn
 %% Returns ok if under limit, {error, limit_reached} if over
+%% For a connection that is already counted (revalidation).
+over_connection_limit(_OrgId, unlimited) -> false;
+over_connection_limit(undefined, _MaxConn) -> false;
+over_connection_limit(OrgId, MaxConn) ->
+    length(syn:members(kraken_connections, {org, OrgId})) > MaxConn.
+
 check_connection_limit(_OrgId, unlimited) -> ok;
 check_connection_limit(undefined, _MaxConn) -> ok;
 check_connection_limit(OrgId, MaxConn) ->
