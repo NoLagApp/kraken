@@ -66,8 +66,23 @@ release start).
 | Var | Default | Meaning |
 |-----|---------|---------|
 | `CLUSTER_STRATEGY` | `standalone` | `standalone`, `dns`, `epmd`, `gossip` |
-| `CLUSTER_DNS_NAME` | — | DNS name resolving to peer IPs (dns) |
-| `CLUSTER_HOSTS` | — | comma-separated node names (epmd) |
-| `CLUSTER_GOSSIP_PORT` / `CLUSTER_GOSSIP_SECRET` | `45892` / — | gossip multicast |
+| `CLUSTER_DNS_NAME` | (unset) | DNS name whose A records are the peer IPs (dns). `CLUSTER_DNS_QUERY` is accepted as an alias |
+| `CLUSTER_NODE_BASENAME` | name part of this node's `ERLANG_NODE_NAME` | dns: peers are dialled as `<basename>@<ip>` |
+| `CLUSTER_HOSTS` | (unset) | comma-separated node names (epmd) |
+| `CLUSTER_GOSSIP_PORT` | `45892` | UDP port for gossip announces |
+| `CLUSTER_MULTICAST_ADDR` | `230.1.1.1` | multicast group for gossip announces |
+| `CLUSTER_GOSSIP_SECRET` | (unset) | key that signs gossip announces (HMAC-SHA256); the cookie is used when unset |
+| `CLUSTER_POLL_INTERVAL` | `30000` | ms between dns/epmd polls and gossip re-announces |
 | `ERLANG_NODE_NAME` | `kraken@127.0.0.1` | **longnames: host part must be an FQDN or IP** |
-| `ERLANG_COOKIE` | `kraken_dev_cookie` | must match across the cluster |
+| `ERLANG_COOKIE` | `kraken_dev_cookie` | must match across the cluster; never logged |
+
+- `dns`: name every node `<basename>@<its own IP>` (in Kubernetes,
+  `ERLANG_NODE_NAME=kraken@$(POD_IP)` with a headless Service as
+  `CLUSTER_DNS_NAME`), because peers are dialled at the IPs the name returns.
+- `gossip`: UDP multicast with TTL 1, so nodes must share a network segment
+  that carries multicast. A user-defined Docker bridge does; most cloud VPCs
+  do not. An announce only tells peers where to dial: joining still needs the
+  same `ERLANG_COOKIE`.
+- The cookie grants full remote code execution on every node. Set a long
+  random value and keep epmd (4369) and the distribution ports (9100-9200)
+  off untrusted networks.

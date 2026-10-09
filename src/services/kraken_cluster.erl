@@ -7,6 +7,8 @@
 %%   - epmd: EPMD-based discovery with static hosts
 %%   - gossip: UDP multicast discovery (same subnet)
 %%
+%% The Erlang cookie is never logged: anyone holding it can run arbitrary
+%% code on every node in the cluster.
 %% @end
 %%%-------------------------------------------------------------------
 -module(kraken_cluster).
@@ -24,12 +26,22 @@
     poll_timer :: reference() | undefined,
     gossip_socket :: port() | undefined,
     gossip_multicast_addr :: tuple() | undefined,
-    gossip_port :: integer()
+    gossip_port :: integer(),
+    gossip_key :: binary() | undefined
 }).
 
 -define(DEFAULT_POLL_INTERVAL, 30000).
 -define(DEFAULT_GOSSIP_PORT, 45892).
 -define(DEFAULT_MULTICAST_ADDR, {230, 1, 1, 1}).
+%% Cookies that ship in this repo's Dockerfile and compose files, so they are
+%% public knowledge and must not be relied on outside local testing.
+-define(EXAMPLE_COOKIES, [kraken_dev_cookie, kraken_cluster_cookie]).
+
+-ifdef(TEST).
+-export([dns_name/0, node_basename/0, node_basename/2,
+         gossip_key/0, gossip_packet/2, verify_gossip_packet/2,
+         cookie_status/1]).
+-endif.
 
 %%====================================================================
 %% API
@@ -56,7 +68,7 @@ init([]) ->
 
     kraken_log:info("[ClusterManager] Starting with strategy: ~p~n", [Strategy]),
     kraken_log:info("[ClusterManager] Node name: ~p~n", [node()]),
-    kraken_log:info("[ClusterManager] Cookie: ~p~n", [erlang:get_cookie()]),
+    kraken_log:info("[ClusterManager] Cookie: ~s~n", [cookie_status(erlang:get_cookie())]),
 
     State0 = #state{
         strategy = Strategy,
@@ -83,7 +95,8 @@ init([]) ->
                 poll_timer = Timer,
                 gossip_socket = Socket,
                 gossip_multicast_addr = MulticastAddr,
-                gossip_port = Port
+                gossip_port = Port,
+                gossip_key = gossip_key()
             }
     end,
 
@@ -107,6 +120,23 @@ handle_info(poll_epmd, #state{poll_interval = Interval} = State) ->
     discover_via_epmd(),
     Timer = erlang:send_after(Interval, self(), poll_epmd),
     {noreply, State#state{poll_timer = Timer}};
+
+%% Announce this node on the multicast group, then again every poll interval
+%% so a node that missed earlier announces (it started later, or a packet was
+%% dropped) still finds its peers.
+handle_info(gossip_announce, #state{poll_interval = Interval} = State) ->
+    send_gossip_announce(State),
+    Timer = erlang:send_after(Interval, self(), gossip_announce),
+    {noreply, State#state{poll_timer = Timer}};
+
+%% The socket is {active, once} and re-armed after each packet, so a flood of
+%% packets backs up in (and is dropped by) the kernel socket buffer instead
+%% of growing this process's mailbox.
+handle_info({udp, Socket, IP, _InPort, Packet},
+            #state{gossip_socket = Socket, gossip_key = Key} = State) ->
+    handle_gossip_message(Packet, IP, Key),
+    ok = inet:setopts(Socket, [{active, once}]),
+    {noreply, State};
 
 handle_info({nodeup, Node, _Info}, State) ->
     kraken_log:info("[ClusterManager] Node joined: ~p~n", [Node]),
@@ -154,13 +184,24 @@ get_poll_interval() ->
         Val -> list_to_integer(Val)
     end.
 
+%% Describes the cookie without revealing it.
+cookie_status(nocookie) ->
+    "none (distribution is not running)";
+cookie_status(Cookie) ->
+    case lists:member(Cookie, ?EXAMPLE_COOKIES) of
+        true -> "WARNING: using the example value from this repo; "
+                "set ERLANG_COOKIE to a long random secret before exposing the "
+                "Erlang distribution ports";
+        false -> "custom value set"
+    end.
+
 %%====================================================================
 %% Internal functions - DNS Discovery
 %%====================================================================
 
 discover_via_dns() ->
-    Query = os:getenv("CLUSTER_DNS_QUERY", ""),
-    NodeBasename = os:getenv("CLUSTER_NODE_BASENAME", "kraken_proxy"),
+    Query = dns_name(),
+    NodeBasename = node_basename(),
 
     case Query of
         "" ->
@@ -176,6 +217,37 @@ discover_via_dns() ->
                         connect_if_not_self(NodeName)
                     end, IPs)
             end
+    end.
+
+%% CLUSTER_DNS_NAME is the documented name; CLUSTER_DNS_QUERY is the name
+%% earlier releases read, kept as an alias. Empty counts as unset (the
+%% Dockerfile defaults CLUSTER_DNS_NAME to "").
+dns_name() ->
+    case env_nonempty("CLUSTER_DNS_NAME") of
+        false -> case env_nonempty("CLUSTER_DNS_QUERY") of
+                     false -> "";
+                     Query -> Query
+                 end;
+        Name -> Name
+    end.
+
+%% Peers are dialled as <basename>@<ip>. The basename defaults to the name
+%% part of this node's own name (kraken for kraken@10.0.0.5), since every
+%% node in a cluster normally runs with the same ERLANG_NODE_NAME prefix.
+node_basename() ->
+    node_basename(env_nonempty("CLUSTER_NODE_BASENAME"), node()).
+
+node_basename(false, Node) ->
+    [Name | _] = string:split(atom_to_list(Node), "@"),
+    Name;
+node_basename(Override, _Node) ->
+    Override.
+
+env_nonempty(Var) ->
+    case os:getenv(Var) of
+        false -> false;
+        "" -> false;
+        Value -> Value
     end.
 
 %%====================================================================
@@ -214,7 +286,7 @@ setup_gossip() ->
 
     {ok, Socket} = gen_udp:open(Port, [
         binary,
-        {active, true},
+        {active, once},
         {reuseaddr, true},
         {multicast_ttl, 1},
         {multicast_loop, true},
@@ -226,25 +298,56 @@ setup_gossip() ->
 
     {ok, Socket, MulticastAddr, Port}.
 
-send_gossip_announce(Socket, MulticastAddr, Port) ->
-    NodeBin = atom_to_binary(node(), utf8),
-    Cookie = erlang:get_cookie(),
-    CookieHash = crypto:hash(sha256, atom_to_binary(Cookie, utf8)),
-    Message = <<CookieHash/binary, NodeBin/binary>>,
-    gen_udp:send(Socket, MulticastAddr, Port, Message).
+send_gossip_announce(#state{gossip_socket = Socket, gossip_multicast_addr = Addr,
+                             gossip_port = Port, gossip_key = Key}) ->
+    case gen_udp:send(Socket, Addr, Port, gossip_packet(Key, node())) of
+        ok -> ok;
+        {error, Reason} ->
+            kraken_log:info("[ClusterManager] Gossip announce failed: ~p~n", [Reason])
+    end.
 
-handle_gossip_message(<<CookieHash:32/binary, NodeBin/binary>>) ->
-    OurCookie = erlang:get_cookie(),
-    OurHash = crypto:hash(sha256, atom_to_binary(OurCookie, utf8)),
-    case CookieHash of
-        OurHash ->
-            NodeName = binary_to_atom(NodeBin, utf8),
-            connect_if_not_self(NodeName);
-        _ ->
-            ok
+%% Announces are signed with HMAC-SHA256 over the node name. The key is
+%% CLUSTER_GOSSIP_SECRET when set, otherwise the Erlang cookie. The secret
+%% only controls which announces a node acts on: joining the cluster still
+%% needs the matching cookie in the Erlang distribution handshake.
+gossip_key() ->
+    case env_nonempty("CLUSTER_GOSSIP_SECRET") of
+        false -> atom_to_binary(erlang:get_cookie(), utf8);
+        Secret -> unicode:characters_to_binary(Secret)
+    end.
+
+gossip_packet(Key, Node) ->
+    NodeBin = atom_to_binary(Node, utf8),
+    <<(crypto:mac(hmac, sha256, Key, NodeBin))/binary, NodeBin/binary>>.
+
+%% Returns {ok, Node} only for a packet signed with Key that carries a
+%% plausible node name; the atom is created only after the signature checks.
+verify_gossip_packet(Key, <<Mac:32/binary, NodeBin/binary>>)
+  when byte_size(NodeBin) > 0, byte_size(NodeBin) =< 255 ->
+    case crypto:hash_equals(Mac, crypto:mac(hmac, sha256, Key, NodeBin)) of
+        true ->
+            case binary:split(NodeBin, <<"@">>) of
+                [Name, Host] when Name =/= <<>>, Host =/= <<>> ->
+                    try {ok, binary_to_atom(NodeBin, utf8)}
+                    catch error:_ -> {error, bad_node_name}
+                    end;
+                _ ->
+                    {error, bad_node_name}
+            end;
+        false ->
+            {error, bad_signature}
     end;
-handle_gossip_message(_) ->
-    ok.
+verify_gossip_packet(_Key, _Packet) ->
+    {error, malformed}.
+
+handle_gossip_message(Packet, IP, Key) ->
+    case verify_gossip_packet(Key, Packet) of
+        {ok, Node} ->
+            connect_if_not_self(Node);
+        {error, Reason} ->
+            kraken_log:info("[ClusterManager] Ignored gossip packet from ~s: ~p~n",
+                            [inet:ntoa(IP), Reason])
+    end.
 
 %%====================================================================
 %% Internal functions - Connection

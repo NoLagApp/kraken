@@ -80,7 +80,8 @@ receive.
   replay of unacknowledged messages on reconnect (store-backed)
 - **Echo control, per-subscription filters, load-balanced subscriptions**
 - **Webhooks**: hydration + trigger webhooks per topic
-- **Clustering**: dns / epmd / gossip discovery (Erlang distribution)
+- **Clustering**: dns / epmd / gossip discovery (Erlang distribution);
+  see [docs/CONFIG.md](docs/CONFIG.md#clustering)
 - **Embeddable**: use kraken as a rebar3 dependency and provide your own
   backend modules — see [docs/PLUGINS.md](docs/PLUGINS.md)
 
